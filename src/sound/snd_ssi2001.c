@@ -1,5 +1,11 @@
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
-#include "../ibm.h"
+#include <wchar.h>
+#define HAVE_STDARG_H
+#include "../86box.h"
 #include "../io.h"
 #include "../device.h"
 #include "sound.h"
@@ -53,12 +59,11 @@ static void ssi2001_write(uint16_t addr, uint8_t val, void *p)
         sid_write(addr, val, p);
 }
 
-void *ssi2001_init()
+void *ssi2001_init(const device_t *info)
 {
         ssi2001_t *ssi2001 = malloc(sizeof(ssi2001_t));
         memset(ssi2001, 0, sizeof(ssi2001_t));
-        
-        pclog("ssi2001_init\n");
+
         ssi2001->psid = sid_init();
         sid_reset(ssi2001->psid);
         io_sethandler(0x0280, 0x0020, ssi2001_read, NULL, NULL, ssi2001_write, NULL, NULL, ssi2001);
@@ -75,14 +80,11 @@ void ssi2001_close(void *p)
         free(ssi2001);
 }
 
-device_t ssi2001_device =
+const device_t ssi2001_device =
 {
         "Innovation SSI-2001",
-        0,
-        ssi2001_init,
-        ssi2001_close,
-        NULL,
-        NULL,
-        NULL,
+        0, 0,
+        ssi2001_init, ssi2001_close, NULL,
+	NULL, NULL, NULL,
         NULL
 };

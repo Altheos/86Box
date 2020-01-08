@@ -1,14 +1,15 @@
-#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
 #include <string.h>
-#include "../ibm.h"
+#include <stdlib.h>
+#include <wchar.h>
+#include "../86box.h"
 #include "../io.h"
+#include "../timer.h"
 #include "../dma.h"
 #include "../pic.h"
-#include "../pit.h"
-#include "../mem.h"
-#include "../rom.h"
-#include "../timer.h"
 #include "../device.h"
+#include "../nvr.h"
 #include "sound.h"
 #include "filters.h"
 #include "snd_opl.h"
@@ -36,7 +37,7 @@ typedef struct adgold_t
         int16_t adgold_mma_out[2];
         int adgold_mma_intpos[2];
 
-        int adgold_mma_timer_count;
+        pc_timer_t adgold_mma_timer_count;
 
         struct
         {
@@ -575,67 +576,64 @@ void adgold_timer_poll(void *p)
 {
         adgold_t *adgold = (adgold_t *)p;
         
-        while (adgold->adgold_mma_timer_count <= 0)
-        {
-                adgold->adgold_mma_timer_count += (int)((double)TIMER_USEC * 1.88964);
-                if (adgold->adgold_mma_regs[0][8] & 0x01) /*Timer 0*/
-                {
-                        adgold->adgold_mma.timer0_count--;
-                        if (!adgold->adgold_mma.timer0_count)
-                        {
-                                adgold->adgold_mma.timer0_count = adgold->adgold_mma.timer0_latch;
-                                adgold->adgold_mma_status |= 0x10;
-                                adgold_update_irq_status(adgold);
-                        }
-                }
-                if (adgold->adgold_mma_regs[0][8] & 0x08) /*Base timer*/
-                {
-                        adgold->adgold_mma.timerbase_count--;
-                        if (!adgold->adgold_mma.timerbase_count)
-                        {
-                                adgold->adgold_mma.timerbase_count = adgold->adgold_mma.timerbase_latch;
-                                if (adgold->adgold_mma_regs[0][8] & 0x02) /*Timer 1*/
-                                {
-                                        adgold->adgold_mma.timer1_count--;
-                                        if (!adgold->adgold_mma.timer1_count)
-                                        {
-                                                adgold->adgold_mma.timer1_count = adgold->adgold_mma.timer1_latch;
-                                                adgold->adgold_mma_status |= 0x20;
-                                                adgold_update_irq_status(adgold);
-                                        }
-                                }
-                                if (adgold->adgold_mma_regs[0][8] & 0x04) /*Timer 2*/
-                                {
-                                        adgold->adgold_mma.timer2_count--;
-                                        if (!adgold->adgold_mma.timer2_count)
-                                        {
-                                                adgold->adgold_mma.timer2_count = adgold->adgold_mma.timer2_latch;
-                                                adgold->adgold_mma_status |= 0x40;
-                                                adgold_update_irq_status(adgold);
-                                        }
-                                }
-                        }
-                }
+		timer_advance_u64(&adgold->adgold_mma_timer_count, (uint64_t)((double)TIMER_USEC * 1.88964));
+		if (adgold->adgold_mma_regs[0][8] & 0x01) /*Timer 0*/
+		{
+				adgold->adgold_mma.timer0_count--;
+				if (!adgold->adgold_mma.timer0_count)
+				{
+						adgold->adgold_mma.timer0_count = adgold->adgold_mma.timer0_latch;
+						adgold->adgold_mma_status |= 0x10;
+						adgold_update_irq_status(adgold);
+				}
+		}
+		if (adgold->adgold_mma_regs[0][8] & 0x08) /*Base timer*/
+		{
+				adgold->adgold_mma.timerbase_count--;
+				if (!adgold->adgold_mma.timerbase_count)
+				{
+						adgold->adgold_mma.timerbase_count = adgold->adgold_mma.timerbase_latch;
+						if (adgold->adgold_mma_regs[0][8] & 0x02) /*Timer 1*/
+						{
+								adgold->adgold_mma.timer1_count--;
+								if (!adgold->adgold_mma.timer1_count)
+								{
+										adgold->adgold_mma.timer1_count = adgold->adgold_mma.timer1_latch;
+										adgold->adgold_mma_status |= 0x20;
+										adgold_update_irq_status(adgold);
+								}
+						}
+						if (adgold->adgold_mma_regs[0][8] & 0x04) /*Timer 2*/
+						{
+								adgold->adgold_mma.timer2_count--;
+								if (!adgold->adgold_mma.timer2_count)
+								{
+										adgold->adgold_mma.timer2_count = adgold->adgold_mma.timer2_latch;
+										adgold->adgold_mma_status |= 0x40;
+										adgold_update_irq_status(adgold);
+								}
+						}
+				}
+		}
 
-                if (adgold->adgold_mma_enable[0])
-                {
-                        adgold->adgold_mma.voice_count[0]--;
-                        if (!adgold->adgold_mma.voice_count[0])
-                        {
-                                adgold->adgold_mma.voice_count[0] = adgold->adgold_mma.voice_latch[0];
-                                adgold_mma_poll(adgold, 0);
-                        }
-                }
-                if (adgold->adgold_mma_enable[1])
-                {
-                        adgold->adgold_mma.voice_count[1]--;
-                        if (!adgold->adgold_mma.voice_count[1])
-                        {
-                                adgold->adgold_mma.voice_count[1] = adgold->adgold_mma.voice_latch[1];
-                                adgold_mma_poll(adgold, 1);
-                        }
-                }
-        }
+		if (adgold->adgold_mma_enable[0])
+		{
+				adgold->adgold_mma.voice_count[0]--;
+				if (!adgold->adgold_mma.voice_count[0])
+				{
+						adgold->adgold_mma.voice_count[0] = adgold->adgold_mma.voice_latch[0];
+						adgold_mma_poll(adgold, 0);
+				}
+		}
+		if (adgold->adgold_mma_enable[1])
+		{
+				adgold->adgold_mma.voice_count[1]--;
+				if (!adgold->adgold_mma.voice_count[1])
+				{
+						adgold->adgold_mma.voice_count[1] = adgold->adgold_mma.voice_latch[1];
+						adgold_mma_poll(adgold, 1);
+				}
+		}
 }
 
 static void adgold_get_buffer(int32_t *buffer, int len, void *p)
@@ -750,7 +748,7 @@ static void adgold_get_buffer(int32_t *buffer, int len, void *p)
 }
 
 
-void *adgold_init()
+void *adgold_init(const device_t *info)
 {
         FILE *f;
         int c;
@@ -773,7 +771,7 @@ void *adgold_init()
         for (; c >= 0; c--)
                 attenuation[c] = 0;
 
-        f = nvrfopen(L"adgold.bin", L"rb");
+        f = nvr_fopen(L"adgold.bin", L"rb");
         if (f)
         {
                 fread(adgold->adgold_eeprom, 0x18, 1, f);
@@ -801,7 +799,7 @@ void *adgold_init()
         /*388/389 are handled by adlib_init*/
         io_sethandler(0x0388, 0x0008, adgold_read, NULL, NULL, adgold_write, NULL, NULL, adgold);
         
-        timer_add(adgold_timer_poll, &adgold->adgold_mma_timer_count, TIMER_ALWAYS_ENABLED, adgold);
+		timer_add(&adgold->adgold_mma_timer_count, adgold_timer_poll, adgold, 1);
 
         sound_add_handler(adgold_get_buffer, adgold);
         
@@ -813,7 +811,7 @@ void adgold_close(void *p)
         FILE *f;
         adgold_t *adgold = (adgold_t *)p;
         
-        f = nvrfopen(L"adgold.bin", L"wb");
+        f = nvr_fopen(L"adgold.bin", L"wb");
         if (f)
         {
                 fwrite(adgold->adgold_eeprom, 0x18, 1, f);
@@ -823,7 +821,7 @@ void adgold_close(void *p)
         free(adgold);
 }
 
-static device_config_t adgold_config[] =
+static const device_config_t adgold_config[] =
 {
         {
                 "surround", "Surround module", CONFIG_BINARY, "", 1
@@ -833,13 +831,13 @@ static device_config_t adgold_config[] =
         }
 };
 
-device_t adgold_device =
+const device_t adgold_device =
 {
         "AdLib Gold",
-        0,
+        DEVICE_ISA, 0,
         adgold_init,
         adgold_close,
-        NULL,
+	NULL,
         NULL,
         NULL,
         NULL,

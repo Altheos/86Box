@@ -1,52 +1,72 @@
 /* some code borrowed from scummvm */
 #ifdef USE_FLUIDSYNTH
-
-
-#include <stdlib.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-#include <fluidsynth.h>
+#include <stdlib.h>
+#include <wchar.h>
+#include "../86box.h"
 #include "../config.h"
-#include "../win/plat_dynld.h"
-#include "../win/plat_thread.h"
-#include "../win/plat_ui.h"
 #include "../device.h"
-#include "midi_fluidsynth.h"
+#include "../plat.h"
+#include "../plat_dynld.h"
+#include "../ui.h"
 #include "midi.h"
+#include "midi_fluidsynth.h"
 #include "sound.h"
+
+
+#define FLUID_CHORUS_DEFAULT_N		3
+#define FLUID_CHORUS_DEFAULT_LEVEL	2.0f
+#define FLUID_CHORUS_DEFAULT_SPEED	0.3f
+#define FLUID_CHORUS_DEFAULT_DEPTH	8.0f
+#define FLUID_CHORUS_DEFAULT_TYPE	FLUID_CHORUS_MOD_SINE
 
 #define RENDER_RATE 100
 #define BUFFER_SEGMENTS 10
 
+
+enum fluid_chorus_mod {
+  FLUID_CHORUS_MOD_SINE = 0,
+  FLUID_CHORUS_MOD_TRIANGLE = 1
+};
+
+enum fluid_interp {
+  FLUID_INTERP_NONE = 0,
+  FLUID_INTERP_LINEAR = 1,
+  FLUID_INTERP_DEFAULT = 4,
+  FLUID_INTERP_4THORDER = 4,
+  FLUID_INTERP_7THORDER = 7,
+  FLUID_INTERP_HIGHEST = 7
+};
+
+
 extern void givealbuffer_midi(void *buf, uint32_t size);
-extern void pclog(const char *format, ...);
 extern void al_set_midi(int freq, int buf_size);
-extern int soundon;
 
 static void	*fluidsynth_handle;		/* handle to FluidSynth DLL */
 
 /* Pointers to the real functions. */
-static fluid_settings_t*(*f_new_fluid_settings)(void);
-static void 		(*f_delete_fluid_settings)(fluid_settings_t *settings);
-static int 		(*f_fluid_settings_setnum)(fluid_settings_t *settings, const char *name, double val);
-static int 		(*f_fluid_settings_getnum)(fluid_settings_t *settings, const char *name, double *val);
-static fluid_synth_t * 	(*f_new_fluid_synth)(fluid_settings_t *settings);
-static int 		(*f_delete_fluid_synth)(fluid_synth_t *synth);
-static int 		(*f_fluid_synth_noteon)(fluid_synth_t *synth, int chan, int key, int vel);
-static int 		(*f_fluid_synth_noteoff)(fluid_synth_t *synth, int chan, int key);
-static int 		(*f_fluid_synth_cc)(fluid_synth_t *synth, int chan, int ctrl, int val);
-static int 		(*f_fluid_synth_sysex)(fluid_synth_t *synth, const char *data, int len, char *response, int *response_len, int *handled, int dryrun);
-static int 		(*f_fluid_synth_pitch_bend)(fluid_synth_t *synth, int chan, int val);
-static int 		(*f_fluid_synth_program_change)(fluid_synth_t *synth, int chan, int program);
-static int 		(*f_fluid_synth_sfload)(fluid_synth_t *synth, const char *filename, int reset_presets);
-static int 		(*f_fluid_synth_sfunload)(fluid_synth_t *synth, unsigned int id, int reset_presets);
-static int 		(*f_fluid_synth_set_interp_method)(fluid_synth_t *synth, int chan, int interp_method);
-static void 		(*f_fluid_synth_set_reverb)(fluid_synth_t *synth, double roomsize, double damping, double width, double level);
-static void 		(*f_fluid_synth_set_reverb_on)(fluid_synth_t *synth, int on);
-static void 		(*f_fluid_synth_set_chorus)(fluid_synth_t *synth, int nr, double level, double speed, double depth_ms, int type);
-static void 		(*f_fluid_synth_set_chorus_on)(fluid_synth_t *synth, int on);
-static int		(*f_fluid_synth_write_s16)(fluid_synth_t *synth, int len, void *lout, int loff, int lincr, void *rout, int roff, int rincr);
-static int		(*f_fluid_synth_write_float)(fluid_synth_t *synth, int len, void *lout, int loff, int lincr, void *rout, int roff, int rincr);
+static void *		(*f_new_fluid_settings)(void);
+static void 		(*f_delete_fluid_settings)(void *settings);
+static int 		(*f_fluid_settings_setnum)(void *settings, const char *name, double val);
+static int 		(*f_fluid_settings_getnum)(void *settings, const char *name, double *val);
+static void * 		(*f_new_fluid_synth)(void *settings);
+static int 		(*f_delete_fluid_synth)(void *synth);
+static int 		(*f_fluid_synth_noteon)(void *synth, int chan, int key, int vel);
+static int 		(*f_fluid_synth_noteoff)(void *synth, int chan, int key);
+static int 		(*f_fluid_synth_cc)(void *synth, int chan, int ctrl, int val);
+static int 		(*f_fluid_synth_sysex)(void *synth, const char *data, int len, char *response, int *response_len, int *handled, int dryrun);
+static int 		(*f_fluid_synth_pitch_bend)(void *synth, int chan, int val);
+static int 		(*f_fluid_synth_program_change)(void *synth, int chan, int program);
+static int 		(*f_fluid_synth_sfload)(void *synth, const char *filename, int reset_presets);
+static int 		(*f_fluid_synth_set_interp_method)(void *synth, int chan, int interp_method);
+static void 		(*f_fluid_synth_set_reverb)(void *synth, double roomsize, double damping, double width, double level);
+static void 		(*f_fluid_synth_set_reverb_on)(void *synth, int on);
+static void 		(*f_fluid_synth_set_chorus)(void *synth, int nr, double level, double speed, double depth_ms, int type);
+static void 		(*f_fluid_synth_set_chorus_on)(void *synth, int on);
+static int		(*f_fluid_synth_write_s16)(void *synth, int len, void *lout, int loff, int lincr, void *rout, int roff, int rincr);
+static int		(*f_fluid_synth_write_float)(void *synth, int len, void *lout, int loff, int lincr, void *rout, int roff, int rincr);
 static char*		(*f_fluid_version_str)(void);
 static dllimp_t fluidsynth_imports[] = {
   { "new_fluid_settings",		&f_new_fluid_settings			},
@@ -62,7 +82,6 @@ static dllimp_t fluidsynth_imports[] = {
   { "fluid_synth_pitch_bend",		&f_fluid_synth_pitch_bend		},
   { "fluid_synth_program_change",	&f_fluid_synth_program_change		},
   { "fluid_synth_sfload",		&f_fluid_synth_sfload			},
-  { "fluid_synth_sfunload",		&f_fluid_synth_sfunload			},
   { "fluid_synth_set_interp_method",	&f_fluid_synth_set_interp_method	},
   { "fluid_synth_set_reverb",		&f_fluid_synth_set_reverb		},
   { "fluid_synth_set_reverb_on",	&f_fluid_synth_set_reverb_on		},
@@ -77,18 +96,19 @@ static dllimp_t fluidsynth_imports[] = {
 
 typedef struct fluidsynth
 {
-        fluid_settings_t* settings;
-        fluid_synth_t* synth;
+        void* settings;
+        void* synth;
         int samplerate;
         int sound_font;
 
-        thread_t* thread_h;
-        event_t* event;
+        thread_t *thread_h;
+        event_t *event, *start_event;
         int buf_size;
         float* buffer;
         int16_t* buffer_int16;
         int midi_pos;
 
+	int on;
 } fluidsynth_t;
 
 fluidsynth_t fsdev;
@@ -114,9 +134,14 @@ static void fluidsynth_thread(void *param)
         fluidsynth_t* data = (fluidsynth_t*)param;
 	int buf_pos = 0;
 	int buf_size = data->buf_size / BUFFER_SEGMENTS;
-        while (1)
+
+	thread_set_event(data->start_event);
+
+        while (data->on)
         {
                 thread_wait_event(data->event, -1);
+                thread_reset_event(data->event);
+
 		if (sound_is_float)
 		{
 			float *buf = (float*)((uint8_t*)data->buffer + buf_pos);
@@ -126,8 +151,7 @@ static void fluidsynth_thread(void *param)
 			buf_pos += buf_size;
 			if (buf_pos >= data->buf_size)
 			{
-		                if (soundon)
-        		                givealbuffer_midi(data->buffer, data->buf_size / sizeof(float));
+       		                givealbuffer_midi(data->buffer, data->buf_size / sizeof(float));
 				buf_pos = 0;
 			}
 		}
@@ -140,30 +164,10 @@ static void fluidsynth_thread(void *param)
 			buf_pos += buf_size;
 			if (buf_pos >= data->buf_size)
 			{
-		                if (soundon)
-        		                givealbuffer_midi(data->buffer_int16, data->buf_size / sizeof(int16_t));
+       		                givealbuffer_midi(data->buffer_int16, data->buf_size / sizeof(int16_t));
 				buf_pos = 0;
 			}
 		}
-
-#if 0
-		if (sound_is_float)
-		{
-	                memset(data->buffer, 0, data->buf_size * sizeof(float));
-	                if (data->synth)
-        	                f_fluid_synth_write_float(data->synth, data->buf_size/2, data->buffer, 0, 2, data->buffer, 1, 2);
-	                if (soundon)
-        	                givealbuffer_midi(data->buffer, data->buf_size);
-		}
-		else
-		{
-	                memset(data->buffer, 0, data->buf_size * sizeof(int16_t));
-	                if (data->synth)
-        	                f_fluid_synth_write_s16(data->synth, data->buf_size/2, data->buffer_int16, 0, 2, data->buffer_int16, 1, 2);
-	                if (soundon)
-        	                givealbuffer_midi(data->buffer_int16, data->buf_size);
-		}
-#endif
         }
 }
 
@@ -201,7 +205,6 @@ void fluidsynth_msg(uint8_t *msg)
         case 0xF0:      /* SysEx */
                 break;
         default:
-                pclog("fluidsynth: unknown send() command 0x%02X", cmd);
                 break;
         }
 }
@@ -213,16 +216,22 @@ void fluidsynth_sysex(uint8_t* data, unsigned int len)
         f_fluid_synth_sysex(d->synth, (const char *) data, len, 0, 0, 0, 0);
 }
 
-void* fluidsynth_init(void)
+void* fluidsynth_init(const device_t *info)
 {
         fluidsynth_t* data = &fsdev;
+	midi_device_t* dev;
+
         memset(data, 0, sizeof(fluidsynth_t));
 
 	/* Try loading the DLL. */
+#ifdef _WIN32
 	fluidsynth_handle = dynld_module("libfluidsynth.dll", fluidsynth_imports);
+#else
+	fluidsynth_handle = dynld_module("libfluidsynth.so", fluidsynth_imports);
+#endif
 	if (fluidsynth_handle == NULL)
 	{
-		plat_msgbox_error(IDS_2171);
+		ui_msgbox(MBX_ERROR, (wchar_t *)IDS_2081);
 		return NULL;
 	}
 
@@ -233,7 +242,7 @@ void* fluidsynth_init(void)
 
         data->synth = f_new_fluid_synth(data->settings);
 
-        char* sound_font = device_get_config_string("sound_font");
+        char* sound_font = (char *) device_get_config_string("sound_font");
         data->sound_font = f_fluid_synth_sfload(data->synth, sound_font, 1);
 
         if (device_get_config_int("chorus"))
@@ -299,14 +308,10 @@ void* fluidsynth_init(void)
 	        data->buffer = NULL;
 		data->buffer_int16 = malloc(data->buf_size);
 	}
-        data->event = thread_create_event();
-        data->thread_h = thread_create(fluidsynth_thread, data);
 
         al_set_midi(data->samplerate, data->buf_size);
 
-        pclog("fluidsynth (%s) initialized, samplerate %d, buf_size %d\n", f_fluid_version_str(), data->samplerate, data->buf_size);
-
-        midi_device_t* dev = malloc(sizeof(midi_device_t));
+        dev = malloc(sizeof(midi_device_t));
         memset(dev, 0, sizeof(midi_device_t));
 
         dev->play_msg = fluidsynth_msg;
@@ -314,6 +319,16 @@ void* fluidsynth_init(void)
         dev->poll = fluidsynth_poll;
 
         midi_init(dev);
+
+	data->on = 1;
+
+        data->start_event = thread_create_event();
+
+        data->event = thread_create_event();
+        data->thread_h = thread_create(fluidsynth_thread, data);
+
+	thread_wait_event(data->start_event, -1);
+	thread_reset_event(data->start_event);
 
         return dev;
 }
@@ -324,12 +339,19 @@ void fluidsynth_close(void* p)
 
         fluidsynth_t* data = &fsdev;
 
-        if (data->sound_font != -1)
-                f_fluid_synth_sfunload(data->synth, data->sound_font, 1);
-        f_delete_fluid_synth(data->synth);
-        f_delete_fluid_settings(data->settings);
+	data->on = 0;
+	thread_set_event(data->event);
+	thread_wait(data->thread_h, -1);
 
-        midi_close();
+	if (data->synth) {
+	        f_delete_fluid_synth(data->synth);
+		data->synth = NULL;
+	}
+
+	if (data->settings) {
+	        f_delete_fluid_settings(data->settings);
+		data->settings = NULL;
+	}
 
 	if (data->buffer)
 	{
@@ -349,16 +371,14 @@ void fluidsynth_close(void* p)
 		dynld_close(fluidsynth_handle);
 		fluidsynth_handle = NULL;
 	}
-
-        pclog("fluidsynth closed\n");
 }
 
-static device_config_t fluidsynth_config[] =
+static const device_config_t fluidsynth_config[] =
 {
         {
                 .name = "sound_font",
                 .description = "Sound Font",
-                .type = CONFIG_FILE,
+                .type = CONFIG_FNAME,
                 .default_string = "",
                 .file_filter =
                 {
@@ -529,14 +549,15 @@ static device_config_t fluidsynth_config[] =
         }
 };
 
-device_t fluidsynth_device =
+const device_t fluidsynth_device =
 {
         "FluidSynth",
         0,
+        0,
         fluidsynth_init,
         fluidsynth_close,
-        fluidsynth_available,
         NULL,
+        fluidsynth_available,
         NULL,
         NULL,
         fluidsynth_config

@@ -1,9 +1,5 @@
 typedef struct sb_dsp_t
-{		
-		int uart_midi;
-		int uart_irq;
-		int onebyte_midi;
-		
+{
         int sb_type;
 
         int sb_8_length,  sb_8_format,  sb_8_autoinit,  sb_8_pause,  sb_8_enable,  sb_8_autolen,  sb_8_output;
@@ -15,8 +11,12 @@ typedef struct sb_dsp_t
         uint8_t sb_read_data[256];
         int sb_read_wp, sb_read_rp;
         int sb_speaker;
+        int muted;
 
         int sb_data_stat;
+	int uart_midi;
+	int uart_irq;
+	int onebyte_midi;
 
         int sb_irqnum;
 
@@ -50,9 +50,9 @@ typedef struct sb_dsp_t
         
         int sbenable, sb_enable_i;
         
-        int sbcount, sb_count_i;
+        pc_timer_t output_timer, input_timer;
         
-        int sblatcho, sblatchi;
+        uint64_t sblatcho, sblatchi;
         
         uint16_t sb_addr;
         
@@ -60,13 +60,22 @@ typedef struct sb_dsp_t
         
         int asp_data_len;
         
-        int wb_time, wb_full;
-        
+        pc_timer_t wb_timer;
+		int wb_full;
+
+	int busy_count;
+
+        int record_pos_read;
+        int record_pos_write;
+        int16_t record_buffer[0xFFFF];
         int16_t buffer[SOUNDBUFLEN * 2];
         int pos;
 } sb_dsp_t;
 
+void sb_dsp_set_mpu(mpu_t *src_mpu);
+
 void sb_dsp_init(sb_dsp_t *dsp, int type);
+void sb_dsp_close(sb_dsp_t *dsp);
 
 void sb_dsp_setirq(sb_dsp_t *dsp, int irq);
 void sb_dsp_setdma8(sb_dsp_t *dsp, int dma);
@@ -78,7 +87,5 @@ void sb_dsp_speed_changed(sb_dsp_t *dsp);
 void sb_dsp_poll(sb_dsp_t *dsp, int16_t *l, int16_t *r);
 
 void sb_dsp_set_stereo(sb_dsp_t *dsp, int stereo);
-
-void sb_dsp_add_status_info(char *s, int max_len, sb_dsp_t *dsp);
 
 void sb_dsp_update(sb_dsp_t *dsp);

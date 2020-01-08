@@ -1,13 +1,55 @@
-#if defined i386 || defined __i386 || defined __i386__ || defined _X86_ || defined WIN32 || defined _WIN32 || defined _WIN32
+/*
+ * VARCem	Virtual ARchaeological Computer EMulator.
+ *		An emulator of (mostly) x86-based PC systems and devices,
+ *		using the ISA,EISA,VLB,MCA  and PCI system buses, roughly
+ *		spanning the era between 1981 and 1995.
+ *
+ *		This file is part of the VARCem Project.
+ *
+ *		Dynamic Recompiler for Intel 32-bit systems.
+ *
+ * Version:	@(#)codegen_x86.c	1.0.3	2018/05/05
+ *
+ * Authors:	Fred N. van Kempen, <decwiz@yahoo.com>
+ *		Sarah Walker, <tommowalker@tommowalker.co.uk>
+ *		Miran Grca, <mgrca8@gmail.com>
+ *
+ *		Copyright 2018 Fred N. van Kempen.
+ *		Copyright 2008-2018 Sarah Walker.
+ *		Copyright 2016-2018 Miran Grca.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free  Software  Foundation; either  version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is  distributed in the hope that it will be useful, but
+ * WITHOUT   ANY  WARRANTY;  without  even   the  implied  warranty  of
+ * MERCHANTABILITY  or FITNESS  FOR A PARTICULAR  PURPOSE. See  the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the:
+ *
+ *   Free Software Foundation, Inc.
+ *   59 Temple Place - Suite 330
+ *   Boston, MA 02111-1307
+ *   USA.
+ */
+#if defined i386 || defined __i386 || defined __i386__ || defined _X86_ || defined _M_IX86 || defined _M_X64
 
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
 #include <stdlib.h>
-#include "../ibm.h"
+#include <wchar.h>
+#include "../86box.h"
 #include "cpu.h"
+#include "../mem.h"
 #include "x86.h"
 #include "x86_flags.h"
 #include "x86_ops.h"
 #include "x87.h"
-#include "../mem.h"
 
 #include "386_common.h"
 
@@ -19,7 +61,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
-#if defined WIN32 || defined _WIN32 || defined _WIN32
+#if defined _WIN32
 #include <windows.h>
 #endif
 
@@ -952,11 +994,6 @@ static uint32_t gen_MEM_CHECK_WRITE()
         return addr;
 }
 
-/*static void checkdebug(uint32_t a)
-{
-        pclog("checkdebug %08x\n", a);
-}*/
-
 static uint32_t gen_MEM_CHECK_WRITE_W()
 {
         uint32_t addr = (uint32_t)&codeblock[block_current].data[block_pos];
@@ -1130,7 +1167,7 @@ void codegen_init()
 	long pagemask = ~(pagesize - 1);
 #endif
         
-#if defined WIN32 || defined _WIN32 || defined _WIN32
+#ifdef _WIN32
         codeblock = VirtualAlloc(NULL, (BLOCK_SIZE+1) * sizeof(codeblock_t), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 #else
         codeblock = malloc((BLOCK_SIZE+1) * sizeof(codeblock_t));
@@ -1196,10 +1233,17 @@ void codegen_init()
         block_pos = (block_pos + 15) & ~15;
         mem_check_write_l = (uint32_t)gen_MEM_CHECK_WRITE_L();
         
+#ifndef _MSC_VER
         asm(
                 "fstcw %0\n"
                 : "=m" (cpu_state.old_npxc)
         );
+#else
+        __asm
+        {
+                fstcw cpu_state.old_npxc
+        }
+#endif
 }
 
 void codegen_reset()
@@ -1211,20 +1255,6 @@ void codegen_reset()
 
 void dump_block()
 {
-/*        codeblock_t *block = pages[0x119000 >> 12].block;
-
-        pclog("dump_block:\n");
-        while (block)
-        {
-                uint32_t start_pc = (block->pc & 0xffc) | (block->phys & ~0xfff);
-                uint32_t end_pc = (block->endpc & 0xffc) | (block->phys & ~0xfff);
-                pclog(" %p : %08x-%08x  %08x-%08x %p %p\n", (void *)block, start_pc, end_pc,  block->pc, block->endpc, (void *)block->prev, (void *)block->next);
-                if (!block->pc)
-                        fatal("Dead PC=0\n");
-                
-                block = block->next;
-        }
-        pclog("dump_block done\n");*/
 }
 
 static void add_to_block_list(codeblock_t *block)
@@ -1248,8 +1278,8 @@ static void add_to_block_list(codeblock_t *block)
 
         if (block->next)
         {
-                if (!block->next->pc)
-                        fatal("block->next->pc=0 %p %p %x %x\n", (void *)block->next, (void *)codeblock, block_current, block_pos);
+                if (!block->next->valid)
+                        fatal("block->next->valid=0 %p %p %x %x\n", (void *)block->next, (void *)codeblock, block_current, block_pos);
         }
         
         if (block->page_mask2)
@@ -1319,9 +1349,9 @@ static void delete_block(codeblock_t *block)
         if (block == codeblock_hash[HASH(block->phys)])
                 codeblock_hash[HASH(block->phys)] = NULL;
 
-        if (!block->pc)
+        if (!block->valid)
                 fatal("Deleting deleted block\n");
-        block->pc = 0;
+        block->valid = 0;
 
         codeblock_tree_delete(block);
         remove_from_block_list(block, old_pc);
@@ -1369,7 +1399,7 @@ void codegen_block_init(uint32_t phys_addr)
         block_current = (block_current + 1) & BLOCK_MASK;
         block = &codeblock[block_current];
 
-        if (block->pc != 0)
+        if (block->valid != 0)
         {
                 delete_block(block);
                 cpu_recomp_reuse++;
@@ -1377,6 +1407,7 @@ void codegen_block_init(uint32_t phys_addr)
         block_num = HASH(phys_addr);
         codeblock_hash[block_num] = &codeblock[block_current];
 
+	block->valid = 1;
         block->ins = 0;
         block->pc = cs + cpu_state.pc;
         block->_cs = cs;
@@ -1409,6 +1440,8 @@ void codegen_block_start_recompile(codeblock_t *block)
 
         if (block->pc != cs + cpu_state.pc || block->was_recompiled)
                 fatal("Recompile to used block!\n");
+
+        block->status = cpu_cur_status;
 
         block_pos = BLOCK_GPF_OFFSET;
         addbyte(0xc7); /*MOV [ESP],0*/
@@ -1462,13 +1495,13 @@ void codegen_block_start_recompile(codeblock_t *block)
         codegen_fpu_loaded_iq[0] = codegen_fpu_loaded_iq[1] = codegen_fpu_loaded_iq[2] = codegen_fpu_loaded_iq[3] =
         codegen_fpu_loaded_iq[4] = codegen_fpu_loaded_iq[5] = codegen_fpu_loaded_iq[6] = codegen_fpu_loaded_iq[7] = 0;
         
-        _ds.checked = _es.checked = _fs.checked = _gs.checked = (cr0 & 1) ? 0 : 1;
+        cpu_state.seg_ds.checked = cpu_state.seg_es.checked = cpu_state.seg_fs.checked = cpu_state.seg_gs.checked = (cr0 & 1) ? 0 : 1;
 
         block->TOP = cpu_state.TOP;
         block->was_recompiled = 1;
 
-        codegen_flat_ds = cpu_cur_status & CPU_STATUS_FLATDS;
-        codegen_flat_ss = cpu_cur_status & CPU_STATUS_FLATSS;
+        codegen_flat_ds = !(cpu_cur_status & CPU_STATUS_NOTFLATDS);
+        codegen_flat_ss = !(cpu_cur_status & CPU_STATUS_NOTFLATSS);       
 }
 
 void codegen_block_remove()
@@ -1530,8 +1563,8 @@ void codegen_block_generate_end_mask()
                                 fatal("!page_mask2\n");
                         if (block->next_2)
                         {
-                                if (!block->next_2->pc)
-                                        fatal("block->next_2->pc=0 %p\n", (void *)block->next_2);
+                                if (!block->next_2->valid)
+                                        fatal("block->next_2->valid=0 %p\n", (void *)block->next_2);
                         }
 
                         block->dirty_mask2 = &page_2->dirty_mask[(block->phys_2 >> PAGE_MASK_INDEX_SHIFT) & PAGE_MASK_INDEX_MASK];
@@ -1650,10 +1683,6 @@ int opcode_0f_modrm[256] =
         
 void codegen_debug()
 {
-        if (output)
-        {
-                pclog("At %04x(%08x):%04x  %04x(%08x):%04x  es=%08x EAX=%08x BX=%04x ECX=%08x BP=%04x EDX=%08x EDI=%08x\n", CS, cs, cpu_state.pc, SS, ss, ESP,  es,EAX, BX,ECX,BP,  EDX,EDI);
-        }
 }
 
 static x86seg *codegen_generate_ea_16_long(x86seg *op_ea_seg, uint32_t fetchdat, int op_ssegs, uint32_t *op_pc)
@@ -1706,7 +1735,7 @@ static x86seg *codegen_generate_ea_16_long(x86seg *op_ea_seg, uint32_t fetchdat,
                 addlong((uint32_t)&cpu_state.eaaddr);
 
                 if (mod1seg[cpu_rm] == &ss && !op_ssegs)
-                        op_ea_seg = &_ss;
+                        op_ea_seg = &cpu_state.seg_ss;
         }
         return op_ea_seg;
 }
@@ -1762,7 +1791,7 @@ static x86seg *codegen_generate_ea_32_long(x86seg *op_ea_seg, uint32_t fetchdat,
                         addlong(stack_offset);
                 }
                 if (((sib & 7) == 4 || (cpu_mod && (sib & 7) == 5)) && !op_ssegs)
-                        op_ea_seg = &_ss;
+                        op_ea_seg = &cpu_state.seg_ss;
                 if (((sib >> 3) & 7) != 4)
                 {
                         switch (sib >> 6)
@@ -1811,7 +1840,7 @@ static x86seg *codegen_generate_ea_32_long(x86seg *op_ea_seg, uint32_t fetchdat,
                 if (cpu_mod) 
                 {
                         if (cpu_rm == 5 && !op_ssegs)
-                                op_ea_seg = &_ss;
+                                op_ea_seg = &cpu_state.seg_ss;
                         if (cpu_mod == 1) 
                         {
                                 addbyte(0x05);
@@ -1837,7 +1866,7 @@ void codegen_generate_call(uint8_t opcode, OpFn op, uint32_t fetchdat, uint32_t 
         codeblock_t *block = &codeblock[block_current];
         uint32_t op_32 = use32;
         uint32_t op_pc = new_pc;
-        OpFn *op_table = x86_dynarec_opcodes;
+        const OpFn *op_table = x86_dynarec_opcodes;
         RecompOpFn *recomp_op_table = recomp_opcodes;
         int opcode_shift = 0;
         int opcode_mask = 0x3ff;
@@ -1846,7 +1875,7 @@ void codegen_generate_call(uint8_t opcode, OpFn op, uint32_t fetchdat, uint32_t 
         int test_modrm = 1;
         int c;
         
-        op_ea_seg = &_ds;
+        op_ea_seg = &cpu_state.seg_ds;
         op_ssegs = 0;
         op_old_pc = old_pc;
         
@@ -1869,27 +1898,27 @@ void codegen_generate_call(uint8_t opcode, OpFn op, uint32_t fetchdat, uint32_t 
                         break;
                         
                         case 0x26: /*ES:*/
-                        op_ea_seg = &_es;
+                        op_ea_seg = &cpu_state.seg_es;
                         op_ssegs = 1;
                         break;
                         case 0x2e: /*CS:*/
-                        op_ea_seg = &_cs;
+                        op_ea_seg = &cpu_state.seg_cs;
                         op_ssegs = 1;
                         break;
                         case 0x36: /*SS:*/
-                        op_ea_seg = &_ss;
+                        op_ea_seg = &cpu_state.seg_ss;
                         op_ssegs = 1;
                         break;
                         case 0x3e: /*DS:*/
-                        op_ea_seg = &_ds;
+                        op_ea_seg = &cpu_state.seg_ds;
                         op_ssegs = 1;
                         break;
                         case 0x64: /*FS:*/
-                        op_ea_seg = &_fs;
+                        op_ea_seg = &cpu_state.seg_fs;
                         op_ssegs = 1;
                         break;
                         case 0x65: /*GS:*/
-                        op_ea_seg = &_gs;
+                        op_ea_seg = &cpu_state.seg_gs;
                         op_ssegs = 1;
                         break;
                         
@@ -2102,7 +2131,7 @@ generate_call:
         if (op_ea_seg != last_ea_seg)
         {
                 last_ea_seg = op_ea_seg;
-                addbyte(0xC7); /*MOVL $&_ds,(ea_seg)*/
+                addbyte(0xC7); /*MOVL $&cpu_state.seg_ds,(ea_seg)*/
                 addbyte(0x45);
                 addbyte((uint8_t)cpu_state_offset(ea_seg));
                 addlong((uint32_t)op_ea_seg);

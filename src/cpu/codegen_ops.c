@@ -1,5 +1,10 @@
-#include "../ibm.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <wchar.h>
+#include "../86box.h"
 #include "../mem.h"
+#include "cpu.h"
 #include "x86.h"
 #include "x86_ops.h"
 #include "x86_flags.h"
@@ -11,7 +16,7 @@
 
 #ifdef __amd64__
 #include "codegen_ops_x86-64.h"
-#elif defined i386 || defined __i386 || defined __i386__ || defined _X86_ || defined WIN32 || defined _WIN32 || defined _WIN32
+#elif defined i386 || defined __i386 || defined __i386__ || defined _X86_ || defined _M_IX86 || defined _M_X64
 #include "codegen_ops_x86.h"
 #endif
 

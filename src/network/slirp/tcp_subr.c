@@ -40,6 +40,9 @@
 
 #define WANT_SYS_IOCTL_H
 #include <stdlib.h>
+#ifndef _WIN32
+# include <unistd.h>
+#endif
 #include "slirp.h"
 
 /* patchable/settable parameters for tcp */

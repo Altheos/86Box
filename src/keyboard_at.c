@@ -8,824 +8,2594 @@
  *
  *		Intel 8042 (AT keyboard controller) emulation.
  *
- * Version:	@(#)keyboard_at.c	1.0.1	2017/08/23
+ * Version:	@(#)keyboard_at.c	1.0.45	2019/11/15
  *
  * Authors:	Sarah Walker, <http://pcem-emulator.co.uk/>
  *		Miran Grca, <mgrca8@gmail.com>
- *		Copyright 2008-2017 Sarah Walker.
- *		Copyright 2016-2017 Miran Grca.
+ *		Fred N. van Kempen, <decwiz@yahoo.com>
+ *
+ *		Copyright 2008-2019 Sarah Walker.
+ *		Copyright 2016-2019 Miran Grca.
+ *		Copyright 2017-2019 Fred N. van Kempen.
  */
+#include <stdio.h>
 #include <stdint.h>
-#include "ibm.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#define HAVE_STDARG_H
+#include <wchar.h>
+#include "86box.h"
+#include "cpu/cpu.h"
+#include "timer.h"
 #include "io.h"
-#include "mem.h"
 #include "pic.h"
 #include "pit.h"
-#include "timer.h"
-#include "disc.h"
-#include "fdc.h"
+#include "ppi.h"
+#include "mem.h"
+#include "device.h"
+#include "machine/machine.h"
+#include "machine/m_xt_xi8088.h"
+#include "machine/m_at_t3100e.h"
+#include "floppy/fdd.h"
+#include "floppy/fdc.h"
 #include "sound/sound.h"
 #include "sound/snd_speaker.h"
+#include "video/video.h"
 #include "keyboard.h"
-#include "keyboard_at.h"
 
 
-#define STAT_PARITY     0x80
-#define STAT_RTIMEOUT   0x40
-#define STAT_TTIMEOUT   0x20
-#define STAT_MFULL      0x20
-#define STAT_LOCK       0x10
-#define STAT_CD         0x08
-#define STAT_SYSFLAG    0x04
-#define STAT_IFULL      0x02
-#define STAT_OFULL      0x01
+#define STAT_PARITY		0x80
+#define STAT_RTIMEOUT		0x40
+#define STAT_TTIMEOUT		0x20
+#define STAT_MFULL		0x20
+#define STAT_UNLOCKED		0x10
+#define STAT_CD			0x08
+#define STAT_SYSFLAG		0x04
+#define STAT_IFULL		0x02
+#define STAT_OFULL		0x01
 
-#define PS2_REFRESH_TIME (16 * TIMER_USEC)
+#define PS2_REFRESH_TIME	(16 * TIMER_USEC)
 
-#define CCB_UNUSED      0x80
-#define CCB_TRANSLATE   0x40
-#define CCB_PCMODE      0x20
-#define CCB_ENABLEKBD   0x10
-#define CCB_IGNORELOCK  0x08
-#define CCB_SYSTEM      0x04
-#define CCB_ENABLEMINT  0x02
-#define CCB_ENABLEKINT  0x01
+#define CCB_UNUSED		0x80
+#define CCB_TRANSLATE		0x40
+#define CCB_PCMODE		0x20
+#define CCB_ENABLEKBD		0x10
+#define CCB_IGNORELOCK		0x08
+#define CCB_SYSTEM		0x04
+#define CCB_ENABLEMINT		0x02
+#define CCB_ENABLEKINT		0x01
 
-#define CCB_MASK        0x68
-#define MODE_MASK       0x6C
+#define CCB_MASK		0x68
+#define MODE_MASK		0x6c
 
-struct
-{
-        int initialised;
-        int want60;
-        int wantirq, wantirq12;
-        uint8_t command;
-        uint8_t status;
-        uint8_t mem[0x100];
-        uint8_t out;
-        int out_new;
-	uint8_t secr_phase;
-	uint8_t mem_addr;
-        
-        uint8_t input_port;
-        uint8_t output_port;
-        
-        uint8_t key_command;
-        int key_wantdata;
-        
-        int last_irq;
+#define KBC_TYPE_ISA		0x00		/* AT ISA-based chips */
+#define KBC_TYPE_PS2_NOREF	0x01		/* PS2 type, no refresh */
+#define KBC_TYPE_PS2_1		0x02		/* PS2 on PS/2, type 1 */
+#define KBC_TYPE_PS2_2		0x03		/* PS2 on PS/2, type 2 */
+#define KBC_TYPE_MASK		0x03
 
-	uint8_t last_scan_code;
-	uint8_t default_mode;
-        
-        void (*mouse_write)(uint8_t val, void *p);
-        void *mouse_p;
-        
-        int refresh_time;
-        int refresh;
-        
-        int is_ps2;
-} keyboard_at;
+#define KBC_VEN_GENERIC		0x00
+#define KBC_VEN_AMI		0x04
+#define KBC_VEN_IBM_MCA		0x08
+#define KBC_VEN_QUADTEL		0x0c
+#define KBC_VEN_TOSHIBA		0x10
+#define KBC_VEN_XI8088		0x14
+#define KBC_VEN_IBM_PS1		0x18
+#define KBC_VEN_ACER		0x1c
+#define KBC_VEN_MASK		0x1c
 
-static uint8_t key_ctrl_queue[16];
-static int key_ctrl_queue_start = 0, key_ctrl_queue_end = 0;
 
-static uint8_t key_queue[16];
-static int key_queue_start = 0, key_queue_end = 0;
+typedef struct {
+    uint8_t	command, status, out, secr_phase,
+		mem_addr, input_port, output_port, old_output_port,
+		key_command, output_locked, ami_stat, initialized,
+		want60, wantirq, key_wantdata, refresh, first_write;
 
-static uint8_t mouse_queue[16];
-int mouse_queue_start = 0, mouse_queue_end = 0;
+    uint8_t	mem[0x100];
 
-int first_write = 1;
-int dtrans = 0;
+    int		out_new, out_delayed;
+    int		last_irq;
+
+    uint32_t	flags;
+
+    pc_timer_t	refresh_time, pulse_cb;
+
+    uint8_t	(*write60_ven)(void *p, uint8_t val);
+    uint8_t	(*write64_ven)(void *p, uint8_t val);
+
+    pc_timer_t send_delay_timer;
+#ifdef USE_NEW_STUFF
+    /* Custom machine-dependent keyboard stuff. */
+    uint8_t	(*read_func)(void *priv);
+    void	(*write_func)(void *priv, uint8_t val);
+    void	*func_priv;
+#endif
+} atkbd_t;
+
+
+/* bit 0 = repeat, bit 1 = makes break code? */
+uint8_t		keyboard_set3_flags[512];
+uint8_t		keyboard_set3_all_repeat;
+uint8_t		keyboard_set3_all_break;
 
 /* Bits 0 - 1 = scan code set, bit 6 = translate or not. */
-uint8_t mode = 0x42;
+uint8_t		keyboard_mode = 0x42;
 
-#if 0
-/* Translated to non-translated scan codes. */
-					/*	Assuming we get XSET1, SET1/XSET2/XSET3 = T_TO_NONT(XSET1), and then we go through
-						T_TO_NONT again to get SET2/SET3.							*/
-/* static uint8_t t_to_nont[256] = {	0xFF, 0x76, 0x16, 0x1E, 0x26, 0x25, 0x2E, 0x36, 0x3D, 0x3E, 0x46, 0x45, 0x4E, 0x55, 0x66, 0x0D,
-					0x15, 0x1D, 0x24, 0x2D, 0x2C, 0x35, 0x3C, 0x43, 0x44, 0x4D, 0x54, 0x5B, 0x5A, 0x14, 0x1C, 0x1B,
-					0x23, 0x2B, 0x34, 0x33, 0x3B, 0x42, 0x4B, 0x4C, 0x52, 0x0E, 0x12, 0x5D, 0x1A, 0x22, 0x21, 0x2A,
-					0x32, 0x31, 0x3A, 0x41, 0x49, 0x4A, 0x59, 0x7C, 0x11, 0x29, 0x58, 0x05, 0x06, 0x04, 0x0C, 0x03,
-					0x0B, 0x02, 0x0A, 0x01, 0x09, 0x77, 0x7E, 0x6C, 0x75, 0x7D, 0x7B, 0x6B, 0x73, 0x74, 0x79, 0x69,
-					0x72, 0x7A, 0x70, 0x71, 0x7F, 0x60, 0x61, 0x78, 0x07, 0x0F, 0x17, 0x1F, 0x27, 0x2F, 0x37, 0x3F,
-					0x47, 0x4F, 0x56, 0x5E, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x57, 0x6F,
-					0x13, 0x19, 0x39, 0x51, 0x53, 0x5C, 0x5F, 0x62, 0x63, 0x64, 0x65, 0x67, 0x68, 0x6A, 0x6D, 0x6E,
-					0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F,
-					0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F,
-					0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
-					0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF,
-					0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF,
-					0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF,
-					0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF,
-					0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF	}; */
-#endif
+int		mouse_queue_start = 0,
+		mouse_queue_end = 0;
+
+
+static uint8_t	key_ctrl_queue[16];
+static int	key_ctrl_queue_start = 0,
+		key_ctrl_queue_end = 0;
+static uint8_t	key_queue[16];
+static int	key_queue_start = 0,
+		key_queue_end = 0;
+static uint8_t	mouse_queue[16];
+static void	(*mouse_write)(uint8_t val, void *priv) = NULL;
+static void	*mouse_p = NULL;
+static uint8_t	sc_or = 0;
+static atkbd_t	*SavedKbd = NULL;		// FIXME: remove!!! --FvK
+
 
 /* Non-translated to translated scan codes. */
-static uint8_t nont_to_t[256] = {	0xFF, 0x43, 0x41, 0x3F, 0x3D, 0x3B, 0x3C, 0x58, 0x64, 0x44, 0x42, 0x40, 0x3E, 0x0F, 0x29, 0x59,
-					0x65, 0x38, 0x2A, 0x70, 0x1D, 0x10, 0x02, 0x5A, 0x66, 0x71, 0x2C, 0x1F, 0x1E, 0x11, 0x03, 0x5B,
-					0x67, 0x2E, 0x2D, 0x20, 0x12, 0x05, 0x04, 0x5C, 0x68, 0x39, 0x2F, 0x21, 0x14, 0x13, 0x06, 0x5D,
-					0x69, 0x31, 0x30, 0x23, 0x22, 0x15, 0x07, 0x5E, 0x6A, 0x72, 0x32, 0x24, 0x16, 0x08, 0x09, 0x5F,
-					0x6B, 0x33, 0x25, 0x17, 0x18, 0x0B, 0x0A, 0x60, 0x6C, 0x34, 0x35, 0x26, 0x27, 0x19, 0x0C, 0x61,
-					0x6D, 0x73, 0x28, 0x74, 0x1A, 0x0D, 0x62, 0x6E, 0x3A, 0x36, 0x1C, 0x1B, 0x75, 0x2B, 0x63, 0x76,
-					0x55, 0x56, 0x77, 0x78, 0x79, 0x7A, 0x0E, 0x7B, 0x7C, 0x4F, 0x7D, 0x4B, 0x47, 0x7E, 0x7F, 0x6F,
-					0x52, 0x53, 0x50, 0x4C, 0x4D, 0x48, 0x01, 0x45, 0x57, 0x4E, 0x51, 0x4A, 0x37, 0x49, 0x46, 0x54,
-					0x80, 0x81, 0x82, 0x41, 0x54, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F,
-					0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F,
-					0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
-					0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF,
-					0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF,
-					0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF,
-					0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF,
-					0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF	};
+static const uint8_t nont_to_t[256] = {
+  0xff, 0x43, 0x41, 0x3f, 0x3d, 0x3b, 0x3c, 0x58,
+  0x64, 0x44, 0x42, 0x40, 0x3e, 0x0f, 0x29, 0x59,
+  0x65, 0x38, 0x2a, 0x70, 0x1d, 0x10, 0x02, 0x5a,
+  0x66, 0x71, 0x2c, 0x1f, 0x1e, 0x11, 0x03, 0x5b,
+  0x67, 0x2e, 0x2d, 0x20, 0x12, 0x05, 0x04, 0x5c,
+  0x68, 0x39, 0x2f, 0x21, 0x14, 0x13, 0x06, 0x5d,
+  0x69, 0x31, 0x30, 0x23, 0x22, 0x15, 0x07, 0x5e,
+  0x6a, 0x72, 0x32, 0x24, 0x16, 0x08, 0x09, 0x5f,
+  0x6b, 0x33, 0x25, 0x17, 0x18, 0x0b, 0x0a, 0x60,
+  0x6c, 0x34, 0x35, 0x26, 0x27, 0x19, 0x0c, 0x61,
+  0x6d, 0x73, 0x28, 0x74, 0x1a, 0x0d, 0x62, 0x6e,
+  0x3a, 0x36, 0x1c, 0x1b, 0x75, 0x2b, 0x63, 0x76,
+  0x55, 0x56, 0x77, 0x78, 0x79, 0x7a, 0x0e, 0x7b,
+  0x7c, 0x4f, 0x7d, 0x4b, 0x47, 0x7e, 0x7f, 0x6f,
+  0x52, 0x53, 0x50, 0x4c, 0x4d, 0x48, 0x01, 0x45,
+  0x57, 0x4e, 0x51, 0x4a, 0x37, 0x49, 0x46, 0x54,
+  0x80, 0x81, 0x82, 0x41, 0x54, 0x85, 0x86, 0x87,
+  0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
+  0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+  0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
+  0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+  0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+  0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
+  0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf,
+  0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7,
+  0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf,
+  0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7,
+  0xd8, 0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde, 0xdf,
+  0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7,
+  0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef,
+  0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
+  0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff
+};
 
-static void keyboard_at_poll(void)
+#ifdef USE_SET1
+static const scancode scancode_set1[512] = {
+    { {          0},{               0} }, { {     0x01,0},{          0x81,0} }, { {     0x02,0},{          0x82,0} }, { {     0x03,0},{          0x83,0} },        /*000*/
+    { {     0x04,0},{          0x84,0} }, { {     0x05,0},{          0x85,0} }, { {     0x06,0},{          0x86,0} }, { {     0x07,0},{          0x87,0} },        /*004*/
+    { {     0x08,0},{          0x88,0} }, { {     0x09,0},{          0x89,0} }, { {     0x0a,0},{          0x8a,0} }, { {     0x0b,0},{          0x8b,0} },        /*008*/
+    { {     0x0c,0},{          0x8c,0} }, { {     0x0d,0},{          0x8d,0} }, { {     0x0e,0},{          0x8e,0} }, { {     0x0f,0},{          0x8f,0} },        /*00c*/
+    { {     0x10,0},{          0x90,0} }, { {     0x11,0},{          0x91,0} }, { {     0x12,0},{          0x92,0} }, { {     0x13,0},{          0x93,0} },        /*010*/
+    { {     0x14,0},{          0x94,0} }, { {     0x15,0},{          0x95,0} }, { {     0x16,0},{          0x96,0} }, { {     0x17,0},{          0x97,0} },        /*014*/
+    { {     0x18,0},{          0x98,0} }, { {     0x19,0},{          0x99,0} }, { {     0x1a,0},{          0x9a,0} }, { {     0x1b,0},{          0x9b,0} },        /*018*/
+    { {     0x1c,0},{          0x9c,0} }, { {     0x1d,0},{          0x9d,0} }, { {     0x1e,0},{          0x9e,0} }, { {     0x1f,0},{          0x9f,0} },        /*01c*/
+    { {     0x20,0},{          0xa0,0} }, { {     0x21,0},{          0xa1,0} }, { {     0x22,0},{          0xa2,0} }, { {     0x23,0},{          0xa3,0} },        /*020*/
+    { {     0x24,0},{          0xa4,0} }, { {     0x25,0},{          0xa5,0} }, { {     0x26,0},{          0xa6,0} }, { {     0x27,0},{          0xa7,0} },        /*024*/
+    { {     0x28,0},{          0xa8,0} }, { {     0x29,0},{          0xa9,0} }, { {     0x2a,0},{          0xaa,0} }, { {     0x2b,0},{          0xab,0} },        /*028*/
+    { {     0x2c,0},{          0xac,0} }, { {     0x2d,0},{          0xad,0} }, { {     0x2e,0},{          0xae,0} }, { {     0x2f,0},{          0xaf,0} },        /*02c*/
+    { {     0x30,0},{          0xb0,0} }, { {     0x31,0},{          0xb1,0} }, { {     0x32,0},{          0xb2,0} }, { {     0x33,0},{          0xb3,0} },        /*030*/
+    { {     0x34,0},{          0xb4,0} }, { {     0x35,0},{          0xb5,0} }, { {     0x36,0},{          0xb6,0} }, { {     0x37,0},{          0xb7,0} },        /*034*/
+    { {     0x38,0},{          0xb8,0} }, { {     0x39,0},{          0xb9,0} }, { {     0x3a,0},{          0xba,0} }, { {     0x3b,0},{          0xbb,0} },        /*038*/
+    { {     0x3c,0},{          0xbc,0} }, { {     0x3d,0},{          0xbd,0} }, { {     0x3e,0},{          0xbe,0} }, { {     0x3f,0},{          0xbf,0} },        /*03c*/
+    { {     0x40,0},{          0xc0,0} }, { {     0x41,0},{          0xc1,0} }, { {     0x42,0},{          0xc2,0} }, { {     0x43,0},{          0xc3,0} },        /*040*/
+    { {     0x44,0},{          0xc4,0} }, { {     0x45,0},{          0xc5,0} }, { {     0x46,0},{          0xc6,0} }, { {     0x47,0},{          0xc7,0} },        /*044*/
+    { {     0x48,0},{          0xc8,0} }, { {     0x49,0},{          0xc9,0} }, { {     0x4a,0},{          0xca,0} }, { {     0x4b,0},{          0xcb,0} },        /*048*/
+    { {     0x4c,0},{          0xcc,0} }, { {     0x4d,0},{          0xcd,0} }, { {     0x4e,0},{          0xce,0} }, { {     0x4f,0},{          0xcf,0} },        /*04c*/
+    { {     0x50,0},{          0xd0,0} }, { {     0x51,0},{          0xd1,0} }, { {     0x52,0},{          0xd2,0} }, { {     0x53,0},{          0xd3,0} },        /*050*/
+    { {     0x54,0},{          0xd4,0} }, { {     0x55,0},{          0xd5,0} }, { {     0x56,0},{          0xd6,0} }, { {     0x57,0},{          0xd7,0} },        /*054*/
+    { {     0x58,0},{          0xd8,0} }, { {     0x59,0},{          0xd9,0} }, { {     0x5a,0},{          0xda,0} }, { {     0x5b,0},{          0xdb,0} },        /*058*/
+    { {     0x5c,0},{          0xdc,0} }, { {     0x5d,0},{          0xdd,0} }, { {     0x5e,0},{          0xde,0} }, { {     0x5f,0},{          0xdf,0} },        /*05c*/
+    { {     0x60,0},{          0xe0,0} }, { {     0x61,0},{          0xe1,0} }, { {     0x62,0},{          0xe2,0} }, { {     0x63,0},{          0xe3,0} },        /*060*/
+    { {     0x64,0},{          0xe4,0} }, { {     0x65,0},{          0xe5,0} }, { {     0x66,0},{          0xe6,0} }, { {     0x67,0},{          0xe7,0} },        /*064*/
+    { {     0x68,0},{          0xe8,0} }, { {     0x69,0},{          0xe9,0} }, { {     0x6a,0},{          0xea,0} }, { {     0x6b,0},{          0xeb,0} },        /*068*/
+    { {     0x6c,0},{          0xec,0} }, { {     0x6d,0},{          0xed,0} }, { {     0x6e,0},{          0xee,0} }, { {     0x6f,0},{          0xef,0} },        /*06c*/
+    { {     0x70,0},{          0xf0,0} }, { {     0x71,0},{          0xf1,0} }, { {     0x72,0},{          0xf2,0} }, { {     0x73,0},{          0xf3,0} },        /*070*/
+    { {     0x74,0},{          0xf4,0} }, { {     0x75,0},{          0xf5,0} }, { {     0x76,0},{          0xf6,0} }, { {     0x77,0},{          0xf7,0} },        /*074*/
+    { {     0x78,0},{          0xf8,0} }, { {     0x79,0},{          0xf9,0} }, { {     0x7a,0},{          0xfa,0} }, { {     0x7b,0},{          0xfb,0} },        /*078*/
+    { {     0x7c,0},{          0xfc,0} }, { {     0x7d,0},{          0xfd,0} }, { {     0x7e,0},{          0xfe,0} }, { {     0x7f,0},{          0xff,0} },        /*07c*/
+
+    { {     0x80,0},{               0} }, { {     0x81,0},{               0} }, { {     0x82,0},{               0} }, { {          0},{               0} },        /*080*/
+    { {          0},{               0} }, { {     0x85,0},{               0} }, { {     0x86,0},{               0} }, { {     0x87,0},{               0} },        /*084*/
+    { {     0x88,0},{               0} }, { {     0x89,0},{               0} }, { {     0x8a,0},{               0} }, { {     0x8b,0},{               0} },        /*088*/
+    { {     0x8c,0},{               0} }, { {     0x8d,0},{               0} }, { {     0x8e,0},{               0} }, { {     0x8f,0},{               0} },        /*08c*/
+    { {     0x90,0},{               0} }, { {     0x91,0},{               0} }, { {     0x92,0},{               0} }, { {     0x93,0},{               0} },        /*090*/
+    { {     0x94,0},{               0} }, { {     0x95,0},{               0} }, { {     0x96,0},{               0} }, { {     0x97,0},{               0} },        /*094*/
+    { {     0x98,0},{               0} }, { {     0x99,0},{               0} }, { {     0x9a,0},{               0} }, { {     0x9b,0},{               0} },        /*098*/
+    { {     0x9c,0},{               0} }, { {     0x9d,0},{               0} }, { {     0x9e,0},{               0} }, { {     0x9f,0},{               0} },        /*09c*/
+    { {     0xa0,0},{               0} }, { {     0xa1,0},{               0} }, { {     0xa2,0},{               0} }, { {     0xa3,0},{               0} },        /*0a0*/
+    { {     0xa4,0},{               0} }, { {     0xa5,0},{               0} }, { {     0xa6,0},{               0} }, { {     0xa7,0},{               0} },        /*0a4*/
+    { {     0xa8,0},{               0} }, { {     0xa9,0},{               0} }, { {     0xaa,0},{               0} }, { {     0xab,0},{               0} },        /*0a8*/
+    { {     0xac,0},{               0} }, { {     0xad,0},{               0} }, { {     0xae,0},{               0} }, { {     0xaf,0},{               0} },        /*0ac*/
+    { {     0xb0,0},{               0} }, { {     0xb1,0},{               0} }, { {     0xb2,0},{               0} }, { {     0xb3,0},{               0} },        /*0b0*/
+    { {     0xb4,0},{               0} }, { {     0xb5,0},{               0} }, { {     0xb6,0},{               0} }, { {     0xb7,0},{               0} },        /*0b4*/
+    { {     0xb8,0},{               0} }, { {     0xb9,0},{               0} }, { {     0xba,0},{               0} }, { {     0xbb,0},{               0} },        /*0b8*/
+    { {     0xbc,0},{               0} }, { {     0xbd,0},{               0} }, { {     0xbe,0},{               0} }, { {     0xbf,0},{               0} },        /*0bc*/
+    { {     0xc0,0},{               0} }, { {     0xc1,0},{               0} }, { {     0xc2,0},{               0} }, { {     0xc3,0},{               0} },        /*0c0*/
+    { {     0xc4,0},{               0} }, { {     0xc5,0},{               0} }, { {     0xc6,0},{               0} }, { {     0xc7,0},{               0} },        /*0c4*/
+    { {     0xc8,0},{               0} }, { {     0xc9,0},{               0} }, { {     0xca,0},{               0} }, { {     0xcb,0},{               0} },        /*0c8*/
+    { {     0xcc,0},{               0} }, { {     0xcd,0},{               0} }, { {     0xce,0},{               0} }, { {     0xcf,0},{               0} },        /*0cc*/
+    { {     0xd0,0},{               0} }, { {     0xd1,0},{               0} }, { {     0xd2,0},{               0} }, { {     0xd3,0},{               0} },        /*0d0*/
+    { {     0xd4,0},{               0} }, { {     0xd5,0},{               0} }, { {     0xd6,0},{               0} }, { {     0xd7,0},{               0} },        /*0d4*/
+    { {     0xd8,0},{               0} }, { {     0xd9,0},{               0} }, { {     0xda,0},{               0} }, { {     0xdb,0},{               0} },        /*0d8*/
+    { {     0xdc,0},{               0} }, { {     0xdd,0},{               0} }, { {     0xde,0},{               0} }, { {     0xdf,0},{               0} },        /*0dc*/
+    { {     0xe0,0},{               0} }, { {     0xe1,0},{               0} }, { {     0xe2,0},{               0} }, { {     0xe3,0},{               0} },        /*0e0*/
+    { {     0xe4,0},{               0} }, { {     0xe5,0},{               0} }, { {     0xe6,0},{               0} }, { {     0xe7,0},{               0} },        /*0e4*/
+    { {     0xe8,0},{               0} }, { {     0xe9,0},{               0} }, { {     0xea,0},{               0} }, { {     0xeb,0},{               0} },        /*0e8*/
+    { {     0xec,0},{               0} }, { {     0xed,0},{               0} }, { {     0xee,0},{               0} }, { {     0xef,0},{               0} },        /*0ec*/
+    { {          0},{               0} }, { {     0xf1,0},{               0} }, { {     0xf2,0},{               0} }, { {     0xf3,0},{               0} },        /*0f0*/
+    { {     0xf4,0},{               0} }, { {     0xf5,0},{               0} }, { {     0xf6,0},{               0} }, { {     0xf7,0},{               0} },        /*0f4*/
+    { {     0xf8,0},{               0} }, { {     0xf9,0},{               0} }, { {     0xfa,0},{               0} }, { {     0xfb,0},{               0} },        /*0f8*/
+    { {     0xfc,0},{               0} }, { {     0xfd,0},{               0} }, { {     0xfe,0},{               0} }, { {     0xff,0},{               0} },        /*0fc*/
+
+    { {0xe1,0x1d,0},{0xe1,     0x9d,0} }, { {0xe0,0x01,0},{0xe0,     0x81,0} }, { {0xe0,0x02,0},{0xe0,     0x82,0} }, { {0xe0,0x03,0},{0xe0,     0x83,0} },        /*100*/
+    { {0xe0,0x04,0},{0xe0,     0x84,0} }, { {0xe0,0x05,0},{0xe0,     0x85,0} }, { {0xe0,0x06,0},{0xe0,     0x86,0} }, { {0xe0,0x07,0},{0xe0,     0x87,0} },        /*104*/
+    { {0xe0,0x08,0},{0xe0,     0x88,0} }, { {0xe0,0x09,0},{0xe0,     0x89,0} }, { {0xe0,0x0a,0},{0xe0,     0x8a,0} }, { {0xe0,0x0b,0},{0xe0,     0x8b,0} },        /*108*/
+    { {0xe0,0x0c,0},{0xe0,     0x8c,0} }, { {          0},{               0} }, { {0xe0,0x0e,0},{0xe0,     0x8e,0} }, { {0xe0,0x0f,0},{0xe0,     0x8f,0} },        /*10c*/
+    { {0xe0,0x10,0},{0xe0,     0x90,0} }, { {0xe0,0x11,0},{0xe0,     0x91,0} }, { {0xe0,0x12,0},{0xe0,     0x92,0} }, { {0xe0,0x13,0},{0xe0,     0x93,0} },        /*110*/
+    { {0xe0,0x14,0},{0xe0,     0x94,0} }, { {0xe0,0x15,0},{0xe0,     0x95,0} }, { {0xe0,0x16,0},{0xe0,     0x96,0} }, { {0xe0,0x17,0},{0xe0,     0x97,0} },        /*114*/
+    { {0xe0,0x18,0},{0xe0,     0x98,0} }, { {0xe0,0x19,0},{0xe0,     0x99,0} }, { {0xe0,0x1a,0},{0xe0,     0x9a,0} }, { {0xe0,0x1b,0},{0xe0,     0x9b,0} },        /*118*/
+    { {0xe0,0x1c,0},{0xe0,     0x9c,0} }, { {0xe0,0x1d,0},{0xe0,     0x9d,0} }, { {0xe0,0x1e,0},{0xe0,     0x9e,0} }, { {0xe0,0x1f,0},{0xe0,     0x9f,0} },        /*11c*/
+    { {0xe0,0x20,0},{0xe0,     0xa0,0} }, { {0xe0,0x21,0},{0xe0,     0xa1,0} }, { {0xe0,0x22,0},{0xe0,     0xa2,0} }, { {0xe0,0x23,0},{0xe0,     0xa3,0} },        /*120*/
+    { {0xe0,0x24,0},{0xe0,     0xa4,0} }, { {0xe0,0x25,0},{0xe0,     0xa5,0} }, { {0xe0,0x26,0},{0xe0,     0xa6,0} }, { {          0},{               0} },        /*124*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*128*/
+    { {0xe0,0x2c,0},{0xe0,     0xac,0} }, { {0xe0,0x2d,0},{0xe0,     0xad,0} }, { {0xe0,0x2e,0},{0xe0,     0xae,0} }, { {0xe0,0x2f,0},{0xe0,     0xaf,0} },        /*12c*/
+    { {0xe0,0x30,0},{0xe0,     0xb0,0} }, { {0xe0,0x31,0},{0xe0,     0xb1,0} }, { {0xe0,0x32,0},{0xe0,     0xb2,0} }, { {          0},{               0} },        /*130*/
+    { {0xe0,0x34,0},{0xe0,     0xb4,0} }, { {0xe0,0x35,0},{0xe0,     0xb5,0} }, { {          0},{               0} }, { {0xe0,0x37,0},{0xe0,     0xb7,0} },        /*134*/
+    { {0xe0,0x38,0},{0xe0,     0xb8,0} }, { {          0},{               0} }, { {0xe0,0x3a,0},{0xe0,     0xba,0} }, { {0xe0,0x3b,0},{0xe0,     0xbb,0} },        /*138*/
+    { {0xe0,0x3c,0},{0xe0,     0xbc,0} }, { {0xe0,0x3d,0},{0xe0,     0xbd,0} }, { {0xe0,0x3e,0},{0xe0,     0xbe,0} }, { {0xe0,0x3f,0},{0xe0,     0xbf,0} },        /*13c*/
+    { {0xe0,0x40,0},{0xe0,     0xc0,0} }, { {0xe0,0x41,0},{0xe0,     0xc1,0} }, { {0xe0,0x42,0},{0xe0,     0xc2,0} }, { {0xe0,0x43,0},{0xe0,     0xc3,0} },        /*140*/
+    { {0xe0,0x44,0},{0xe0,     0xc4,0} }, { {          0},{               0} }, { {0xe0,0x46,0},{0xe0,     0xc6,0} }, { {0xe0,0x47,0},{0xe0,     0xc7,0} },        /*144*/
+    { {0xe0,0x48,0},{0xe0,     0xc8,0} }, { {0xe0,0x49,0},{0xe0,     0xc9,0} }, { {          0},{               0} }, { {0xe0,0x4b,0},{0xe0,     0xcb,0} },        /*148*/
+    { {0xe0,0x4c,0},{0xe0,     0xcc,0} }, { {0xe0,0x4d,0},{0xe0,     0xcd,0} }, { {0xe0,0x4e,0},{0xe0,     0xce,0} }, { {0xe0,0x4f,0},{0xe0,     0xcf,0} },        /*14c*/
+    { {0xe0,0x50,0},{0xe0,     0xd0,0} }, { {0xe0,0x51,0},{0xe0,     0xd1,0} }, { {0xe0,0x52,0},{0xe0,     0xd2,0} }, { {0xe0,0x53,0},{0xe0,     0xd3,0} },        /*150*/
+    { {          0},{               0} }, { {0xe0,0x55,0},{0xe0,     0xd5,0} }, { {          0},{               0} }, { {0xe0,0x57,0},{0xe0,     0xd7,0} },        /*154*/
+    { {0xe0,0x58,0},{0xe0,     0xd8,0} }, { {0xe0,0x59,0},{0xe0,     0xd9,0} }, { {0xe0,0x5a,0},{0xe0,     0xaa,0} }, { {0xe0,0x5b,0},{0xe0,     0xdb,0} },        /*158*/
+    { {0xe0,0x5c,0},{0xe0,     0xdc,0} }, { {0xe0,0x5d,0},{0xe0,     0xdd,0} }, { {0xe0,0x5e,0},{0xe0,     0xee,0} }, { {0xe0,0x5f,0},{0xe0,     0xdf,0} },        /*15c*/
+    { {          0},{               0} }, { {0xe0,0x61,0},{0xe0,     0xe1,0} }, { {0xe0,0x62,0},{0xe0,     0xe2,0} }, { {0xe0,0x63,0},{0xe0,     0xe3,0} },        /*160*/
+    { {0xe0,0x64,0},{0xe0,     0xe4,0} }, { {0xe0,0x65,0},{0xe0,     0xe5,0} }, { {0xe0,0x66,0},{0xe0,     0xe6,0} }, { {0xe0,0x67,0},{0xe0,     0xe7,0} },        /*164*/
+    { {0xe0,0x68,0},{0xe0,     0xe8,0} }, { {0xe0,0x69,0},{0xe0,     0xe9,0} }, { {0xe0,0x6a,0},{0xe0,     0xea,0} }, { {0xe0,0x6b,0},{0xe0,     0xeb,0} },        /*168*/
+    { {0xe0,0x6c,0},{0xe0,     0xec,0} }, { {0xe0,0x6d,0},{0xe0,     0xed,0} }, { {0xe0,0x6e,0},{0xe0,     0xee,0} }, { {          0},{               0} },        /*16c*/
+    { {0xe0,0x70,0},{0xe0,     0xf0,0} }, { {0xe0,0x71,0},{0xe0,     0xf1,0} }, { {0xe0,0x72,0},{0xe0,     0xf2,0} }, { {0xe0,0x73,0},{0xe0,     0xf3,0} },        /*170*/
+    { {0xe0,0x74,0},{0xe0,     0xf4,0} }, { {0xe0,0x75,0},{0xe0,     0xf5,0} }, { {          0},{               0} }, { {0xe0,0x77,0},{0xe0,     0xf7,0} },        /*174*/
+    { {0xe0,0x78,0},{0xe0,     0xf8,0} }, { {0xe0,0x79,0},{0xe0,     0xf9,0} }, { {0xe0,0x7a,0},{0xe0,     0xfa,0} }, { {0xe0,0x7b,0},{0xe0,     0xfb,0} },        /*178*/
+    { {0xe0,0x7c,0},{0xe0,     0xfc,0} }, { {0xe0,0x7d,0},{0xe0,     0xfd,0} }, { {0xe0,0x7e,0},{0xe0,     0xfe,0} }, { {0xe0,0x7f,0},{0xe0,     0xff,0} },        /*17c*/
+
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*180*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*184*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*188*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*18c*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*190*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*194*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*198*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*19c*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1a0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1a4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1a8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1ac*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1c0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1c4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1c8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1cc*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1d0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1d4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1d8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1dc*/
+    { {          0},{               0} }, { {0xe0,0xe1,0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1e0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1e4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1e8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {0xe0,0xee,0},{               0} }, { {          0},{               0} },        /*1ec*/
+    { {          0},{               0} }, { {0xe0,0xf1,0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1f0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1f4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1f8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {0xe0,0xfe,0},{               0} }, { {0xe0,0xff,0},{               0} }         /*1fc*/
+};
+#endif
+
+static const scancode scancode_set2[512] = {
+    { {          0},{               0} }, { {     0x76,0},{     0xF0,0x76,0} }, { {     0x16,0},{     0xF0,0x16,0} }, { {     0x1E,0},{     0xF0,0x1E,0} },        /*000*/
+    { {     0x26,0},{     0xF0,0x26,0} }, { {     0x25,0},{     0xF0,0x25,0} }, { {     0x2E,0},{     0xF0,0x2E,0} }, { {     0x36,0},{     0xF0,0x36,0} },        /*004*/
+    { {     0x3D,0},{     0xF0,0x3D,0} }, { {     0x3E,0},{     0xF0,0x3E,0} }, { {     0x46,0},{     0xF0,0x46,0} }, { {     0x45,0},{     0xF0,0x45,0} },        /*008*/
+    { {     0x4E,0},{     0xF0,0x4E,0} }, { {     0x55,0},{     0xF0,0x55,0} }, { {     0x66,0},{     0xF0,0x66,0} }, { {     0x0D,0},{     0xF0,0x0D,0} },        /*00c*/
+    { {     0x15,0},{     0xF0,0x15,0} }, { {     0x1D,0},{     0xF0,0x1D,0} }, { {     0x24,0},{     0xF0,0x24,0} }, { {     0x2D,0},{     0xF0,0x2D,0} },        /*010*/
+    { {     0x2C,0},{     0xF0,0x2C,0} }, { {     0x35,0},{     0xF0,0x35,0} }, { {     0x3C,0},{     0xF0,0x3C,0} }, { {     0x43,0},{     0xF0,0x43,0} },        /*014*/
+    { {     0x44,0},{     0xF0,0x44,0} }, { {     0x4D,0},{     0xF0,0x4D,0} }, { {     0x54,0},{     0xF0,0x54,0} }, { {     0x5B,0},{     0xF0,0x5B,0} },        /*018*/
+    { {     0x5A,0},{     0xF0,0x5A,0} }, { {     0x14,0},{     0xF0,0x14,0} }, { {     0x1C,0},{     0xF0,0x1C,0} }, { {     0x1B,0},{     0xF0,0x1B,0} },        /*01c*/
+    { {     0x23,0},{     0xF0,0x23,0} }, { {     0x2B,0},{     0xF0,0x2B,0} }, { {     0x34,0},{     0xF0,0x34,0} }, { {     0x33,0},{     0xF0,0x33,0} },        /*020*/
+    { {     0x3B,0},{     0xF0,0x3B,0} }, { {     0x42,0},{     0xF0,0x42,0} }, { {     0x4B,0},{     0xF0,0x4B,0} }, { {     0x4C,0},{     0xF0,0x4C,0} },        /*024*/
+    { {     0x52,0},{     0xF0,0x52,0} }, { {     0x0E,0},{     0xF0,0x0E,0} }, { {     0x12,0},{     0xF0,0x12,0} }, { {     0x5D,0},{     0xF0,0x5D,0} },        /*028*/
+    { {     0x1A,0},{     0xF0,0x1A,0} }, { {     0x22,0},{     0xF0,0x22,0} }, { {     0x21,0},{     0xF0,0x21,0} }, { {     0x2A,0},{     0xF0,0x2A,0} },        /*02c*/
+    { {     0x32,0},{     0xF0,0x32,0} }, { {     0x31,0},{     0xF0,0x31,0} }, { {     0x3A,0},{     0xF0,0x3A,0} }, { {     0x41,0},{     0xF0,0x41,0} },        /*030*/
+    { {     0x49,0},{     0xF0,0x49,0} }, { {     0x4A,0},{     0xF0,0x4A,0} }, { {     0x59,0},{     0xF0,0x59,0} }, { {     0x7C,0},{     0xF0,0x7C,0} },        /*034*/
+    { {     0x11,0},{     0xF0,0x11,0} }, { {     0x29,0},{     0xF0,0x29,0} }, { {     0x58,0},{     0xF0,0x58,0} }, { {     0x05,0},{     0xF0,0x05,0} },        /*038*/
+    { {     0x06,0},{     0xF0,0x06,0} }, { {     0x04,0},{     0xF0,0x04,0} }, { {     0x0C,0},{     0xF0,0x0C,0} }, { {     0x03,0},{     0xF0,0x03,0} },        /*03c*/
+    { {     0x0B,0},{     0xF0,0x0B,0} }, { {     0x83,0},{     0xF0,0x83,0} }, { {     0x0A,0},{     0xF0,0x0A,0} }, { {     0x01,0},{     0xF0,0x01,0} },        /*040*/
+    { {     0x09,0},{     0xF0,0x09,0} }, { {     0x77,0},{     0xF0,0x77,0} }, { {     0x7E,0},{     0xF0,0x7E,0} }, { {     0x6C,0},{     0xF0,0x6C,0} },        /*044*/
+    { {     0x75,0},{     0xF0,0x75,0} }, { {     0x7D,0},{     0xF0,0x7D,0} }, { {     0x7B,0},{     0xF0,0x7B,0} }, { {     0x6B,0},{     0xF0,0x6B,0} },        /*048*/
+    { {     0x73,0},{     0xF0,0x73,0} }, { {     0x74,0},{     0xF0,0x74,0} }, { {     0x79,0},{     0xF0,0x79,0} }, { {     0x69,0},{     0xF0,0x69,0} },        /*04c*/
+    { {     0x72,0},{     0xF0,0x72,0} }, { {     0x7A,0},{     0xF0,0x7A,0} }, { {     0x70,0},{     0xF0,0x70,0} }, { {     0x71,0},{     0xF0,0x71,0} },        /*050*/
+    { {     0x84,0},{     0xF0,0x84,0} }, { {     0x60,0},{     0xF0,0x60,0} }, { {     0x61,0},{     0xF0,0x61,0} }, { {     0x78,0},{     0xF0,0x78,0} },        /*054*/
+    { {     0x07,0},{     0xF0,0x07,0} }, { {     0x0F,0},{     0xF0,0x0F,0} }, { {     0x17,0},{     0xF0,0x17,0} }, { {     0x1F,0},{     0xF0,0x1F,0} },        /*058*/
+    { {     0x27,0},{     0xF0,0x27,0} }, { {     0x2F,0},{     0xF0,0x2F,0} }, { {     0x37,0},{     0xF0,0x37,0} }, { {     0x3F,0},{     0xF0,0x3F,0} },        /*05c*/
+    { {     0x47,0},{     0xF0,0x47,0} }, { {     0x4F,0},{     0xF0,0x4F,0} }, { {     0x56,0},{     0xF0,0x56,0} }, { {     0x5E,0},{     0xF0,0x5E,0} },        /*060*/
+    { {     0x08,0},{     0xF0,0x08,0} }, { {     0x10,0},{     0xF0,0x10,0} }, { {     0x18,0},{     0xF0,0x18,0} }, { {     0x20,0},{     0xF0,0x20,0} },        /*064*/
+    { {     0x28,0},{     0xF0,0x28,0} }, { {     0x30,0},{     0xF0,0x30,0} }, { {     0x38,0},{     0xF0,0x38,0} }, { {     0x40,0},{     0xF0,0x40,0} },        /*068*/
+    { {     0x48,0},{     0xF0,0x48,0} }, { {     0x50,0},{     0xF0,0x50,0} }, { {     0x57,0},{     0xF0,0x57,0} }, { {     0x6F,0},{     0xF0,0x6F,0} },        /*06c*/
+    { {     0x13,0},{     0xF0,0x13,0} }, { {     0x19,0},{     0xF0,0x19,0} }, { {     0x39,0},{     0xF0,0x39,0} }, { {     0x51,0},{     0xF0,0x51,0} },        /*070*/
+    { {     0x53,0},{     0xF0,0x53,0} }, { {     0x5C,0},{     0xF0,0x5C,0} }, { {     0x5F,0},{     0xF0,0x5F,0} }, { {     0x62,0},{     0xF0,0x62,0} },        /*074*/
+    { {     0x63,0},{     0xF0,0x63,0} }, { {     0x64,0},{     0xF0,0x64,0} }, { {     0x65,0},{     0xF0,0x65,0} }, { {     0x67,0},{     0xF0,0x67,0} },        /*078*/
+    { {     0x68,0},{     0xF0,0x68,0} }, { {     0x6A,0},{     0xF0,0x6A,0} }, { {     0x6D,0},{     0xF0,0x6D,0} }, { {     0x6E,0},{     0xF0,0x6E,0} },        /*07c*/
+
+    { {     0x80,0},{     0xf0,0x80,0} }, { {     0x81,0},{     0xf0,0x81,0} }, { {     0x82,0},{     0xf0,0x82,0} }, { {          0},{               0} },        /*080*/
+    { {          0},{               0} }, { {     0x85,0},{     0xf0,0x54,0} }, { {     0x86,0},{     0xf0,0x86,0} }, { {     0x87,0},{     0xf0,0x87,0} },        /*084*/
+    { {     0x88,0},{     0xf0,0x88,0} }, { {     0x89,0},{     0xf0,0x89,0} }, { {     0x8a,0},{     0xf0,0x8a,0} }, { {     0x8b,0},{     0xf0,0x8b,0} },        /*088*/
+    { {     0x8c,0},{     0xf0,0x8c,0} }, { {     0x8d,0},{     0xf0,0x8d,0} }, { {     0x8e,0},{     0xf0,0x8e,0} }, { {     0x8f,0},{     0xf0,0x8f,0} },        /*08c*/
+    { {     0x90,0},{     0xf0,0x90,0} }, { {     0x91,0},{     0xf0,0x91,0} }, { {     0x92,0},{     0xf0,0x92,0} }, { {     0x93,0},{     0xf0,0x93,0} },        /*090*/
+    { {     0x94,0},{     0xf0,0x94,0} }, { {     0x95,0},{     0xf0,0x95,0} }, { {     0x96,0},{     0xf0,0x96,0} }, { {     0x97,0},{     0xf0,0x97,0} },        /*094*/
+    { {     0x98,0},{     0xf0,0x98,0} }, { {     0x99,0},{     0xf0,0x99,0} }, { {     0x9a,0},{     0xf0,0x9a,0} }, { {     0x9b,0},{     0xf0,0x9b,0} },        /*098*/
+    { {     0x9c,0},{     0xf0,0x9c,0} }, { {     0x9d,0},{     0xf0,0x9d,0} }, { {     0x9e,0},{     0xf0,0x9e,0} }, { {     0x9f,0},{     0xf0,0x9f,0} },        /*09c*/
+    { {     0xa0,0},{     0xf0,0xa0,0} }, { {     0xa1,0},{     0xf0,0xa1,0} }, { {     0xa2,0},{     0xf0,0xa2,0} }, { {     0xa3,0},{     0xf0,0xa3,0} },        /*0a0*/
+    { {     0xa4,0},{     0xf0,0xa4,0} }, { {     0xa5,0},{     0xf0,0xa5,0} }, { {     0xa6,0},{     0xf0,0xa6,0} }, { {     0xa7,0},{     0xf0,0xa7,0} },        /*0a4*/
+    { {     0xa8,0},{     0xf0,0xa8,0} }, { {     0xa9,0},{     0xf0,0xa9,0} }, { {     0xaa,0},{     0xf0,0xaa,0} }, { {     0xab,0},{     0xf0,0xab,0} },        /*0a8*/
+    { {     0xac,0},{     0xf0,0xac,0} }, { {     0xad,0},{     0xf0,0xad,0} }, { {     0xae,0},{     0xf0,0xae,0} }, { {     0xaf,0},{     0xf0,0xaf,0} },        /*0ac*/
+    { {     0xb0,0},{     0xf0,0xb0,0} }, { {     0xb1,0},{     0xf0,0xb1,0} }, { {     0xb2,0},{     0xf0,0xb2,0} }, { {     0xb3,0},{     0xf0,0xb3,0} },        /*0b0*/
+    { {     0xb4,0},{     0xf0,0xb4,0} }, { {     0xb5,0},{     0xf0,0xb5,0} }, { {     0xb6,0},{     0xf0,0xb6,0} }, { {     0xb7,0},{     0xf0,0xb7,0} },        /*0b4*/
+    { {     0xb8,0},{     0xf0,0xb8,0} }, { {     0xb9,0},{     0xf0,0xb9,0} }, { {     0xba,0},{     0xf0,0xba,0} }, { {     0xbb,0},{     0xf0,0xbb,0} },        /*0b8*/
+    { {     0xbc,0},{     0xf0,0xbc,0} }, { {     0xbd,0},{     0xf0,0xbd,0} }, { {     0xbe,0},{     0xf0,0xbe,0} }, { {     0xbf,0},{     0xf0,0xbf,0} },        /*0bc*/
+    { {     0xc0,0},{     0xf0,0xc0,0} }, { {     0xc1,0},{     0xf0,0xc1,0} }, { {     0xc2,0},{     0xf0,0xc2,0} }, { {     0xc3,0},{     0xf0,0xc3,0} },        /*0c0*/
+    { {     0xc4,0},{     0xf0,0xc4,0} }, { {     0xc5,0},{     0xf0,0xc5,0} }, { {     0xc6,0},{     0xf0,0xc6,0} }, { {     0xc7,0},{     0xf0,0xc7,0} },        /*0c4*/
+    { {     0xc8,0},{     0xf0,0xc8,0} }, { {     0xc9,0},{     0xf0,0xc9,0} }, { {     0xca,0},{     0xf0,0xca,0} }, { {     0xcb,0},{     0xf0,0xcb,0} },        /*0c8*/
+    { {     0xcc,0},{     0xf0,0xcc,0} }, { {     0xcd,0},{     0xf0,0xcd,0} }, { {     0xce,0},{     0xf0,0xce,0} }, { {     0xcf,0},{     0xf0,0xcf,0} },        /*0cc*/
+    { {     0xd0,0},{     0xf0,0xd0,0} }, { {     0xd1,0},{     0xf0,0xd0,0} }, { {     0xd2,0},{     0xf0,0xd2,0} }, { {     0xd3,0},{     0xf0,0xd3,0} },        /*0d0*/
+    { {     0xd4,0},{     0xf0,0xd4,0} }, { {     0xd5,0},{     0xf0,0xd5,0} }, { {     0xd6,0},{     0xf0,0xd6,0} }, { {     0xd7,0},{     0xf0,0xd7,0} },        /*0d4*/
+    { {     0xd8,0},{     0xf0,0xd8,0} }, { {     0xd9,0},{     0xf0,0xd9,0} }, { {     0xda,0},{     0xf0,0xda,0} }, { {     0xdb,0},{     0xf0,0xdb,0} },        /*0d8*/
+    { {     0xdc,0},{     0xf0,0xdc,0} }, { {     0xdd,0},{     0xf0,0xdd,0} }, { {     0xde,0},{     0xf0,0xde,0} }, { {     0xdf,0},{     0xf0,0xdf,0} },        /*0dc*/
+    { {     0xe0,0},{     0xf0,0xe0,0} }, { {     0xe1,0},{     0xf0,0xe1,0} }, { {     0xe2,0},{     0xf0,0xe2,0} }, { {     0xe3,0},{     0xf0,0xe3,0} },        /*0e0*/
+    { {     0xe4,0},{     0xf0,0xe4,0} }, { {     0xe5,0},{     0xf0,0xe5,0} }, { {     0xe6,0},{     0xf0,0xe6,0} }, { {     0xe7,0},{     0xf0,0xe7,0} },        /*0e4*/
+    { {     0xe8,0},{     0xf0,0xe8,0} }, { {     0xe9,0},{     0xf0,0xe9,0} }, { {     0xea,0},{     0xf0,0xea,0} }, { {     0xeb,0},{     0xf0,0xeb,0} },        /*0e8*/
+    { {     0xec,0},{     0xf0,0xec,0} }, { {     0xed,0},{     0xf0,0xed,0} }, { {     0xee,0},{     0xf0,0xee,0} }, { {     0xef,0},{     0xf0,0xef,0} },        /*0ec*/
+    { {          0},{               0} }, { {     0xf1,0},{     0xf0,0xf1,0} }, { {     0xf2,0},{     0xf0,0xf2,0} }, { {     0xf3,0},{     0xf0,0xf3,0} },        /*0f0*/
+    { {     0xf4,0},{     0xf0,0xf4,0} }, { {     0xf5,0},{     0xf0,0xf5,0} }, { {     0xf6,0},{     0xf0,0xf6,0} }, { {     0xf7,0},{     0xf0,0xf7,0} },        /*0f4*/
+    { {     0xf8,0},{     0xf0,0xf8,0} }, { {     0xf9,0},{     0xf0,0xf9,0} }, { {     0xfa,0},{     0xf0,0xfa,0} }, { {     0xfb,0},{     0xf0,0xfb,0} },        /*0f8*/
+    { {     0xfc,0},{     0xf0,0xfc,0} }, { {     0xfd,0},{     0xf0,0xfd,0} }, { {     0xfe,0},{     0xf0,0xfe,0} }, { {     0xff,0},{     0xf0,0xff,0} },        /*0fc*/
+
+    { {0xe1,0x14,0},{0xe1,0xf0,0x14,0} }, { {0xe0,0x76,0},{0xe0,0xF0,0x76,0} }, { {0xe0,0x16,0},{0xe0,0xF0,0x16,0} }, { {0xe0,0x1E,0},{0xe0,0xF0,0x1E,0} },        /*100*/
+    { {0xe0,0x26,0},{0xe0,0xF0,0x26,0} }, { {0xe0,0x25,0},{0xe0,0xF0,0x25,0} }, { {0xe0,0x2E,0},{0xe0,0xF0,0x2E,0} }, { {0xe0,0x36,0},{0xe0,0xF0,0x36,0} },        /*104*/
+    { {0xe0,0x3D,0},{0xe0,0xF0,0x3D,0} }, { {0xe0,0x3E,0},{0xe0,0xF0,0x3E,0} }, { {0xe0,0x46,0},{0xe0,0xF0,0x46,0} }, { {0xe0,0x45,0},{0xe0,0xF0,0x45,0} },        /*108*/
+    { {0xe0,0x4E,0},{0xe0,0xF0,0x4E,0} }, { {          0},{               0} }, { {0xe0,0x66,0},{0xe0,0xF0,0x66,0} }, { {0xe0,0x0D,0},{0xe0,0xF0,0x0D,0} },        /*10c*/
+    { {0xe0,0x15,0},{0xe0,0xF0,0x15,0} }, { {0xe0,0x1D,0},{0xe0,0xF0,0x1D,0} }, { {0xe0,0x24,0},{0xe0,0xF0,0x24,0} }, { {0xe0,0x2D,0},{0xe0,0xF0,0x2D,0} },        /*110*/
+    { {0xe0,0x2C,0},{0xe0,0xF0,0x2C,0} }, { {0xe0,0x35,0},{0xe0,0xF0,0x35,0} }, { {0xe0,0x3C,0},{0xe0,0xF0,0x3C,0} }, { {0xe0,0x43,0},{0xe0,0xF0,0x43,0} },        /*114*/
+    { {0xe0,0x44,0},{0xe0,0xF0,0x44,0} }, { {0xe0,0x4D,0},{0xe0,0xF0,0x4D,0} }, { {0xe0,0x54,0},{0xe0,0xF0,0x54,0} }, { {0xe0,0x5B,0},{0xe0,0xF0,0x5B,0} },        /*118*/
+    { {0xe0,0x5A,0},{0xe0,0xF0,0x5A,0} }, { {0xe0,0x14,0},{0xe0,0xF0,0x14,0} }, { {0xe0,0x1C,0},{0xe0,0xF0,0x1C,0} }, { {0xe0,0x1B,0},{0xe0,0xF0,0x1B,0} },        /*11c*/
+    { {0xe0,0x23,0},{0xe0,0xF0,0x23,0} }, { {0xe0,0x2B,0},{0xe0,0xF0,0x2B,0} }, { {0xe0,0x34,0},{0xe0,0xF0,0x34,0} }, { {0xe0,0x33,0},{0xe0,0xF0,0x33,0} },        /*120*/
+    { {0xe0,0x3B,0},{0xe0,0xF0,0x3B,0} }, { {0xe0,0x42,0},{0xe0,0xF0,0x42,0} }, { {0xe0,0x4B,0},{0xe0,0xF0,0x4B,0} }, { {          0},{               0} },        /*124*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*128*/
+    { {0xe0,0x1A,0},{0xe0,0xF0,0x1A,0} }, { {0xe0,0x22,0},{0xe0,0xF0,0x22,0} }, { {0xe0,0x21,0},{0xe0,0xF0,0x21,0} }, { {0xe0,0x2A,0},{0xe0,0xF0,0x2A,0} },        /*12c*/
+    { {0xe0,0x32,0},{0xe0,0xF0,0x32,0} }, { {0xe0,0x31,0},{0xe0,0xF0,0x31,0} }, { {0xe0,0x3A,0},{0xe0,0xF0,0x3A,0} }, { {          0},{               0} },        /*130*/
+    { {0xe0,0x49,0},{0xe0,0xF0,0x49,0} }, { {0xe0,0x4A,0},{0xe0,0xF0,0x4A,0} }, { {          0},{               0} }, { {0xe0,0x7C,0},{0xe0,0xF0,0x7C,0} },        /*134*/
+    { {0xe0,0x11,0},{0xe0,0xF0,0x11,0} }, { {          0},{               0} }, { {0xe0,0x58,0},{0xe0,0xF0,0x58,0} }, { {0xe0,0x05,0},{0xe0,0xF0,0x05,0} },        /*138*/
+    { {0xe0,0x06,0},{0xe0,0xF0,0x06,0} }, { {0xe0,0x04,0},{0xe0,0xF0,0x04,0} }, { {0xe0,0x0C,0},{0xe0,0xF0,0x0C,0} }, { {0xe0,0x03,0},{0xe0,0xF0,0x03,0} },        /*13c*/
+    { {0xe0,0x0B,0},{0xe0,0xF0,0x0B,0} }, { {0xe0,0x02,0},{0xe0,0xF0,0x02,0} }, { {0xe0,0x0A,0},{0xe0,0xF0,0x0A,0} }, { {0xe0,0x01,0},{0xe0,0xF0,0x01,0} },        /*140*/
+    { {0xe0,0x09,0},{0xe0,0xF0,0x09,0} }, { {          0},{               0} }, { {0xe0,0x7E,0},{0xe0,0xF0,0x7E,0} }, { {0xe0,0x6C,0},{0xe0,0xF0,0x6C,0} },        /*144*/
+    { {0xe0,0x75,0},{0xe0,0xF0,0x75,0} }, { {0xe0,0x7D,0},{0xe0,0xF0,0x7D,0} }, { {          0},{               0} }, { {0xe0,0x6B,0},{0xe0,0xF0,0x6B,0} },        /*148*/
+    { {0xe0,0x73,0},{0xe0,0xF0,0x73,0} }, { {0xe0,0x74,0},{0xe0,0xF0,0x74,0} }, { {0xe0,0x79,0},{0xe0,0xF0,0x79,0} }, { {0xe0,0x69,0},{0xe0,0xF0,0x69,0} },        /*14c*/
+    { {0xe0,0x72,0},{0xe0,0xF0,0x72,0} }, { {0xe0,0x7A,0},{0xe0,0xF0,0x7A,0} }, { {0xe0,0x70,0},{0xe0,0xF0,0x70,0} }, { {0xe0,0x71,0},{0xe0,0xF0,0x71,0} },        /*150*/
+    { {          0},{               0} }, { {0xe0,0x60,0},{0xe0,0xF0,0x60,0} }, { {          0},{               0} }, { {0xe0,0x78,0},{0xe0,0xF0,0x78,0} },        /*154*/
+    { {0xe0,0x07,0},{0xe0,0xF0,0x07,0} }, { {0xe0,0x0F,0},{0xe0,0xF0,0x0F,0} }, { {0xe0,0x17,0},{0xe0,0xF0,0x17,0} }, { {0xe0,0x1F,0},{0xe0,0xF0,0x1F,0} },        /*158*/
+    { {0xe0,0x27,0},{0xe0,0xF0,0x27,0} }, { {0xe0,0x2F,0},{0xe0,0xF0,0x2F,0} }, { {0xe0,0x37,0},{0xe0,0xF0,0x37,0} }, { {0xe0,0x3F,0},{0xe0,0xF0,0x3F,0} },        /*15c*/
+    { {          0},{               0} }, { {0xe0,0x4F,0},{0xe0,0xF0,0x4F,0} }, { {0xe0,0x56,0},{0xe0,0xF0,0x56,0} }, { {0xe0,0x5E,0},{0xe0,0xF0,0x5E,0} },        /*160*/
+    { {0xe0,0x08,0},{0xe0,0xF0,0x08,0} }, { {0xe0,0x10,0},{0xe0,0xF0,0x10,0} }, { {0xe0,0x18,0},{0xe0,0xF0,0x18,0} }, { {0xe0,0x20,0},{0xe0,0xF0,0x20,0} },        /*164*/
+    { {0xe0,0x28,0},{0xe0,0xF0,0x28,0} }, { {0xe0,0x30,0},{0xe0,0xF0,0x30,0} }, { {0xe0,0x38,0},{0xe0,0xF0,0x38,0} }, { {0xe0,0x40,0},{0xe0,0xF0,0x40,0} },        /*168*/
+    { {0xe0,0x48,0},{0xe0,0xF0,0x48,0} }, { {0xe0,0x50,0},{0xe0,0xF0,0x50,0} }, { {0xe0,0x57,0},{0xe0,0xF0,0x57,0} }, { {          0},{               0} },        /*16c*/
+    { {0xe0,0x13,0},{0xe0,0xF0,0x13,0} }, { {0xe0,0x19,0},{0xe0,0xF0,0x19,0} }, { {0xe0,0x39,0},{0xe0,0xF0,0x39,0} }, { {0xe0,0x51,0},{0xe0,0xF0,0x51,0} },        /*170*/
+    { {0xe0,0x53,0},{0xe0,0xF0,0x53,0} }, { {0xe0,0x5C,0},{0xe0,0xF0,0x5C,0} }, { {          0},{               0} }, { {0xe0,0x62,0},{0xe0,0xF0,0x62,0} },        /*174*/
+    { {0xe0,0x63,0},{0xe0,0xF0,0x63,0} }, { {0xe0,0x64,0},{0xe0,0xF0,0x64,0} }, { {0xe0,0x65,0},{0xe0,0xF0,0x65,0} }, { {0xe0,0x67,0},{0xe0,0xF0,0x67,0} },        /*178*/
+    { {0xe0,0x68,0},{0xe0,0xF0,0x68,0} }, { {0xe0,0x6A,0},{0xe0,0xF0,0x6A,0} }, { {0xe0,0x6D,0},{0xe0,0xF0,0x6D,0} }, { {0xe0,0x6E,0},{0xe0,0xF0,0x6E,0} },        /*17c*/
+
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*180*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*184*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*188*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*18c*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*190*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*194*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*198*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*19c*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1a0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1a4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1a8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1ac*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1c0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1c4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1c8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1cc*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1d0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1d4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1d8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1dc*/
+    { {          0},{               0} }, { {0xe0,0xe1,0},{0xe0,0xF0,0xE1,0} }, { {          0},{               0} }, { {          0},{               0} },        /*1e0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1e4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1e8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {0xe0,0xee,0},{0xe0,0xF0,0xEE,0} }, { {          0},{               0} },        /*1ec*/
+    { {          0},{               0} }, { {0xe0,0xf1,0},{0xe0,0xF0,0xF1,0} }, { {          0},{               0} }, { {          0},{               0} },        /*1f0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1f4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1f8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {0xe0,0xfe,0},{0xe0,0xF0,0xFE,0} }, { {0xe0,0xff,0},{0xe0,0xF0,0xFF,0} }         /*1fc*/
+};
+
+static const scancode scancode_set3[512] = {
+    { {          0},{               0} }, { {     0x08,0},{     0xf0,0x08,0} }, { {     0x16,0},{     0xf0,0x16,0} }, { {     0x1E,0},{     0xf0,0x1E,0} },        /*000*/
+    { {     0x26,0},{     0xf0,0x26,0} }, { {     0x25,0},{     0xf0,0x25,0} }, { {     0x2E,0},{     0xf0,0x2E,0} }, { {     0x36,0},{     0xf0,0x36,0} },        /*004*/
+    { {     0x3D,0},{     0xf0,0x3D,0} }, { {     0x3E,0},{     0xf0,0x3E,0} }, { {     0x46,0},{     0xf0,0x46,0} }, { {     0x45,0},{     0xf0,0x45,0} },        /*008*/
+    { {     0x4E,0},{     0xf0,0x4E,0} }, { {     0x55,0},{     0xf0,0x55,0} }, { {     0x66,0},{     0xf0,0x66,0} }, { {     0x0D,0},{     0xf0,0x0D,0} },        /*00c*/
+    { {     0x15,0},{     0xf0,0x15,0} }, { {     0x1D,0},{     0xf0,0x1D,0} }, { {     0x24,0},{     0xf0,0x24,0} }, { {     0x2D,0},{     0xf0,0x2D,0} },        /*010*/
+    { {     0x2C,0},{     0xf0,0x2C,0} }, { {     0x35,0},{     0xf0,0x35,0} }, { {     0x3C,0},{     0xf0,0x3C,0} }, { {     0x43,0},{     0xf0,0x43,0} },        /*014*/
+    { {     0x44,0},{     0xf0,0x44,0} }, { {     0x4D,0},{     0xf0,0x4D,0} }, { {     0x54,0},{     0xf0,0x54,0} }, { {     0x5B,0},{     0xf0,0x5B,0} },        /*018*/
+    { {     0x5A,0},{     0xf0,0x5A,0} }, { {     0x11,0},{     0xf0,0x11,0} }, { {     0x1C,0},{     0xf0,0x1C,0} }, { {     0x1B,0},{     0xf0,0x1B,0} },        /*01c*/
+    { {     0x23,0},{     0xf0,0x23,0} }, { {     0x2B,0},{     0xf0,0x2B,0} }, { {     0x34,0},{     0xf0,0x34,0} }, { {     0x33,0},{     0xf0,0x33,0} },        /*020*/
+    { {     0x3B,0},{     0xf0,0x3B,0} }, { {     0x42,0},{     0xf0,0x42,0} }, { {     0x4B,0},{     0xf0,0x4B,0} }, { {     0x4C,0},{     0xf0,0x4C,0} },        /*024*/
+    { {     0x52,0},{     0xf0,0x52,0} }, { {     0x0E,0},{     0xf0,0x0E,0} }, { {     0x12,0},{     0xf0,0x12,0} }, { {     0x5C,0},{     0xf0,0x5C,0} },        /*028*/
+    { {     0x1A,0},{     0xf0,0x1A,0} }, { {     0x22,0},{     0xf0,0x22,0} }, { {     0x21,0},{     0xf0,0x21,0} }, { {     0x2A,0},{     0xf0,0x2A,0} },        /*02c*/
+    { {     0x32,0},{     0xf0,0x32,0} }, { {     0x31,0},{     0xf0,0x31,0} }, { {     0x3A,0},{     0xf0,0x3A,0} }, { {     0x41,0},{     0xf0,0x41,0} },        /*030*/
+    { {     0x49,0},{     0xf0,0x49,0} }, { {     0x4A,0},{     0xf0,0x4A,0} }, { {     0x59,0},{     0xf0,0x59,0} }, { {     0x7E,0},{     0xf0,0x7E,0} },        /*034*/
+    { {     0x19,0},{     0xf0,0x19,0} }, { {     0x29,0},{     0xf0,0x29,0} }, { {     0x14,0},{     0xf0,0x14,0} }, { {     0x07,0},{     0xf0,0x07,0} },        /*038*/
+    { {     0x0F,0},{     0xf0,0x0F,0} }, { {     0x17,0},{     0xf0,0x17,0} }, { {     0x1F,0},{     0xf0,0x1F,0} }, { {     0x27,0},{     0xf0,0x27,0} },        /*03c*/
+    { {     0x2F,0},{     0xf0,0x2F,0} }, { {     0x37,0},{     0xf0,0x37,0} }, { {     0x3F,0},{     0xf0,0x3F,0} }, { {     0x47,0},{     0xf0,0x47,0} },        /*040*/
+    { {     0x4F,0},{     0xf0,0x4F,0} }, { {     0x76,0},{     0xf0,0x76,0} }, { {     0x5F,0},{     0xf0,0x5F,0} }, { {     0x6C,0},{     0xf0,0x6C,0} },        /*044*/
+    { {     0x75,0},{     0xf0,0x75,0} }, { {     0x7D,0},{     0xf0,0x7D,0} }, { {     0x84,0},{     0xf0,0x84,0} }, { {     0x6B,0},{     0xf0,0x6B,0} },        /*048*/
+    { {     0x73,0},{     0xf0,0x73,0} }, { {     0x74,0},{     0xf0,0x74,0} }, { {     0x7C,0},{     0xf0,0x7C,0} }, { {     0x69,0},{     0xf0,0x69,0} },        /*04c*/
+    { {     0x72,0},{     0xf0,0x72,0} }, { {     0x7A,0},{     0xf0,0x7A,0} }, { {     0x70,0},{     0xf0,0x70,0} }, { {     0x71,0},{     0xf0,0x71,0} },        /*050*/
+    { {     0x57,0},{     0xf0,0x57,0} }, { {     0x60,0},{     0xf0,0x60,0} }, { {          0},{               0} }, { {     0x56,0},{     0xf0,0x56,0} },        /*054*/
+    { {     0x5E,0},{     0xf0,0x5E,0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*058*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*05c*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*060*/
+    { {          0},{               0} }, { {     0x10,0},{     0xf0,0x10,0} }, { {     0x18,0},{     0xf0,0x18,0} }, { {     0x20,0},{     0xf0,0x20,0} },        /*064*/
+    { {     0x28,0},{     0xf0,0x28,0} }, { {     0x30,0},{     0xf0,0x30,0} }, { {     0x38,0},{     0xf0,0x38,0} }, { {     0x40,0},{     0xf0,0x40,0} },        /*068*/
+    { {     0x48,0},{     0xf0,0x48,0} }, { {     0x50,0},{     0xf0,0x50,0} }, { {          0},{               0} }, { {          0},{               0} },        /*06c*/
+    { {     0x87,0},{     0xf0,0x87,0} }, { {          0},{               0} }, { {          0},{               0} }, { {     0x51,0},{     0xf0,0x51,0} },        /*070*/
+    { {     0x53,0},{     0xf0,0x53,0} }, { {     0x5C,0},{     0xf0,0x5C,0} }, { {          0},{               0} }, { {     0x62,0},{     0xf0,0x62,0} },        /*074*/
+    { {     0x63,0},{     0xf0,0x63,0} }, { {     0x86,0},{     0xf0,0x86,0} }, { {          0},{               0} }, { {     0x85,0},{     0xf0,0x85,0} },        /*078*/
+    { {     0x68,0},{     0xf0,0x68,0} }, { {     0x13,0},{     0xf0,0x13,0} }, { {          0},{               0} }, { {          0},{               0} },        /*07c*/
+
+    { {     0x80,0},{     0xf0,0x80,0} }, { {     0x81,0},{     0xf0,0x81,0} }, { {     0x82,0},{     0xf0,0x82,0} }, { {          0},{               0} },        /*080*/
+    { {          0},{               0} }, { {     0x85,0},{     0xf0,0x54,0} }, { {     0x86,0},{     0xf0,0x86,0} }, { {     0x87,0},{     0xf0,0x87,0} },        /*084*/
+    { {     0x88,0},{     0xf0,0x88,0} }, { {     0x89,0},{     0xf0,0x89,0} }, { {     0x8a,0},{     0xf0,0x8a,0} }, { {     0x8b,0},{     0xf0,0x8b,0} },        /*088*/
+    { {          0},{               0} }, { {          0},{               0} }, { {     0x8e,0},{     0xf0,0x8e,0} }, { {     0x8f,0},{     0xf0,0x8f,0} },        /*08c*/
+    { {     0x90,0},{     0xf0,0x90,0} }, { {     0x91,0},{     0xf0,0x91,0} }, { {     0x92,0},{     0xf0,0x92,0} }, { {     0x93,0},{     0xf0,0x93,0} },        /*090*/
+    { {     0x94,0},{     0xf0,0x94,0} }, { {     0x95,0},{     0xf0,0x95,0} }, { {     0x96,0},{     0xf0,0x96,0} }, { {     0x97,0},{     0xf0,0x97,0} },        /*094*/
+    { {     0x98,0},{     0xf0,0x98,0} }, { {     0x99,0},{     0xf0,0x99,0} }, { {     0x9a,0},{     0xf0,0x9a,0} }, { {     0x9b,0},{     0xf0,0x9b,0} },        /*098*/
+    { {     0x9c,0},{     0xf0,0x9c,0} }, { {     0x9d,0},{     0xf0,0x9d,0} }, { {     0x9e,0},{     0xf0,0x9e,0} }, { {     0x9f,0},{     0xf0,0x9f,0} },        /*09c*/
+    { {     0xa0,0},{     0xf0,0xa0,0} }, { {     0xa1,0},{     0xf0,0xa1,0} }, { {     0xa2,0},{     0xf0,0xa2,0} }, { {     0xa3,0},{     0xf0,0xa3,0} },        /*0a0*/
+    { {     0xa4,0},{     0xf0,0xa4,0} }, { {     0xa5,0},{     0xf0,0xa5,0} }, { {     0xa6,0},{     0xf0,0xa6,0} }, { {     0xa7,0},{     0xf0,0xa7,0} },        /*0a4*/
+    { {     0xa8,0},{     0xf0,0xa8,0} }, { {     0xa9,0},{     0xf0,0xa9,0} }, { {     0xaa,0},{     0xf0,0xaa,0} }, { {     0xab,0},{     0xf0,0xab,0} },        /*0a8*/
+    { {     0xac,0},{     0xf0,0xac,0} }, { {     0xad,0},{     0xf0,0xad,0} }, { {     0xae,0},{     0xf0,0xae,0} }, { {     0xaf,0},{     0xf0,0xaf,0} },        /*0ac*/
+    { {     0xb0,0},{     0xf0,0xb0,0} }, { {     0xb1,0},{     0xf0,0xb1,0} }, { {     0xb2,0},{     0xf0,0xb2,0} }, { {     0xb3,0},{     0xf0,0xb3,0} },        /*0b0*/
+    { {     0xb4,0},{     0xf0,0xb4,0} }, { {     0xb5,0},{     0xf0,0xb5,0} }, { {     0xb6,0},{     0xf0,0xb6,0} }, { {     0xb7,0},{     0xf0,0xb7,0} },        /*0b4*/
+    { {     0xb8,0},{     0xf0,0xb8,0} }, { {     0xb9,0},{     0xf0,0xb9,0} }, { {     0xba,0},{     0xf0,0xba,0} }, { {     0xbb,0},{     0xf0,0xbb,0} },        /*0b8*/
+    { {     0xbc,0},{     0xf0,0xbc,0} }, { {     0xbd,0},{     0xf0,0xbd,0} }, { {     0xbe,0},{     0xf0,0xbe,0} }, { {     0xbf,0},{     0xf0,0xbf,0} },        /*0bc*/
+    { {     0xc0,0},{     0xf0,0xc0,0} }, { {     0xc1,0},{     0xf0,0xc1,0} }, { {     0xc2,0},{     0xf0,0xc2,0} }, { {     0xc3,0},{     0xf0,0xc3,0} },        /*0c0*/
+    { {     0xc4,0},{     0xf0,0xc4,0} }, { {     0xc5,0},{     0xf0,0xc5,0} }, { {     0xc6,0},{     0xf0,0xc6,0} }, { {     0xc7,0},{     0xf0,0xc7,0} },        /*0c4*/
+    { {     0xc8,0},{     0xf0,0xc8,0} }, { {     0xc9,0},{     0xf0,0xc9,0} }, { {     0xca,0},{     0xf0,0xca,0} }, { {     0xcb,0},{     0xf0,0xcb,0} },        /*0c8*/
+    { {     0xcc,0},{     0xf0,0xcc,0} }, { {     0xcd,0},{     0xf0,0xcd,0} }, { {     0xce,0},{     0xf0,0xce,0} }, { {     0xcf,0},{     0xf0,0xcf,0} },        /*0cc*/
+    { {     0xd0,0},{     0xf0,0xd0,0} }, { {     0xd1,0},{     0xf0,0xd0,0} }, { {     0xd2,0},{     0xf0,0xd2,0} }, { {     0xd3,0},{     0xf0,0xd3,0} },        /*0d0*/
+    { {     0xd4,0},{     0xf0,0xd4,0} }, { {     0xd5,0},{     0xf0,0xd5,0} }, { {     0xd6,0},{     0xf0,0xd6,0} }, { {     0xd7,0},{     0xf0,0xd7,0} },        /*0d4*/
+    { {     0xd8,0},{     0xf0,0xd8,0} }, { {     0xd9,0},{     0xf0,0xd9,0} }, { {     0xda,0},{     0xf0,0xda,0} }, { {     0xdb,0},{     0xf0,0xdb,0} },        /*0d8*/
+    { {     0xdc,0},{     0xf0,0xdc,0} }, { {     0xdd,0},{     0xf0,0xdd,0} }, { {     0xde,0},{     0xf0,0xde,0} }, { {     0xdf,0},{     0xf0,0xdf,0} },        /*0dc*/
+    { {     0xe0,0},{     0xf0,0xe0,0} }, { {     0xe1,0},{     0xf0,0xe1,0} }, { {     0xe2,0},{     0xf0,0xe2,0} }, { {     0xe3,0},{     0xf0,0xe3,0} },        /*0e0*/
+    { {     0xe4,0},{     0xf0,0xe4,0} }, { {     0xe5,0},{     0xf0,0xe5,0} }, { {     0xe6,0},{     0xf0,0xe6,0} }, { {     0xe7,0},{     0xf0,0xe7,0} },        /*0e4*/
+    { {     0xe8,0},{     0xf0,0xe8,0} }, { {     0xe9,0},{     0xf0,0xe9,0} }, { {     0xea,0},{     0xf0,0xea,0} }, { {     0xeb,0},{     0xf0,0xeb,0} },        /*0e8*/
+    { {     0xec,0},{     0xf0,0xec,0} }, { {     0xed,0},{     0xf0,0xed,0} }, { {     0xee,0},{     0xf0,0xee,0} }, { {     0xef,0},{     0xf0,0xef,0} },        /*0ec*/
+    { {          0},{               0} }, { {     0xf1,0},{     0xf0,0xf1,0} }, { {     0xf2,0},{     0xf0,0xf2,0} }, { {     0xf3,0},{     0xf0,0xf3,0} },        /*0f0*/
+    { {     0xf4,0},{     0xf0,0xf4,0} }, { {     0xf5,0},{     0xf0,0xf5,0} }, { {     0xf6,0},{     0xf0,0xf6,0} }, { {     0xf7,0},{     0xf0,0xf7,0} },        /*0f4*/
+    { {     0xf8,0},{     0xf0,0xf8,0} }, { {     0xf9,0},{     0xf0,0xf9,0} }, { {     0xfa,0},{     0xf0,0xfa,0} }, { {     0xfb,0},{     0xf0,0xfb,0} },        /*0f8*/
+    { {     0xfc,0},{     0xf0,0xfc,0} }, { {     0xfd,0},{     0xf0,0xfd,0} }, { {     0xfe,0},{     0xf0,0xfe,0} }, { {     0xff,0},{     0xf0,0xff,0} },        /*0fc*/
+
+    { {     0x62,0},{     0xF0,0x62,0} }, { {0xe0,0x76,0},{0xe0,0xF0,0x76,0} }, { {0xe0,0x16,0},{0xe0,0xF0,0x16,0} }, { {0xe0,0x1E,0},{0xe0,0xF0,0x1E,0} },        /*100*/
+    { {0xe0,0x26,0},{0xe0,0xF0,0x26,0} }, { {0xe0,0x25,0},{0xe0,0xF0,0x25,0} }, { {0xe0,0x2E,0},{0xe0,0xF0,0x2E,0} }, { {0xe0,0x36,0},{0xe0,0xF0,0x36,0} },        /*104*/
+    { {0xe0,0x3D,0},{0xe0,0xF0,0x3D,0} }, { {0xe0,0x3E,0},{0xe0,0xF0,0x3E,0} }, { {0xe0,0x46,0},{0xe0,0xF0,0x46,0} }, { {0xe0,0x45,0},{0xe0,0xF0,0x45,0} },        /*108*/
+    { {0xe0,0x4E,0},{0xe0,0xF0,0x4E,0} }, { {          0},{               0} }, { {0xe0,0x66,0},{0xe0,0xF0,0x66,0} }, { {0xe0,0x0D,0},{0xe0,0xF0,0x0D,0} },        /*10c*/
+    { {0xe0,0x15,0},{0xe0,0xF0,0x15,0} }, { {0xe0,0x1D,0},{0xe0,0xF0,0x1D,0} }, { {0xe0,0x24,0},{0xe0,0xF0,0x24,0} }, { {0xe0,0x2D,0},{0xe0,0xF0,0x2D,0} },        /*110*/
+    { {0xe0,0x2C,0},{0xe0,0xF0,0x2C,0} }, { {0xe0,0x35,0},{0xe0,0xF0,0x35,0} }, { {0xe0,0x3C,0},{0xe0,0xF0,0x3C,0} }, { {0xe0,0x43,0},{0xe0,0xF0,0x43,0} },        /*114*/
+    { {0xe0,0x44,0},{0xe0,0xF0,0x44,0} }, { {0xe0,0x4D,0},{0xe0,0xF0,0x4D,0} }, { {0xe0,0x54,0},{0xe0,0xF0,0x54,0} }, { {0xe0,0x5B,0},{0xe0,0xF0,0x5B,0} },        /*118*/
+    { {     0x79,0},{     0xf0,0x79,0} }, { {     0x58,0},{     0xf0,0x58,0} }, { {0xe0,0x1C,0},{0xe0,0xF0,0x1C,0} }, { {0xe0,0x1B,0},{0xe0,0xF0,0x1B,0} },        /*11c*/
+    { {0xe0,0x23,0},{0xe0,0xF0,0x23,0} }, { {0xe0,0x2B,0},{0xe0,0xF0,0x2B,0} }, { {0xe0,0x34,0},{0xe0,0xF0,0x34,0} }, { {0xe0,0x33,0},{0xe0,0xF0,0x33,0} },        /*120*/
+    { {0xe0,0x3B,0},{0xe0,0xF0,0x3B,0} }, { {0xe0,0x42,0},{0xe0,0xF0,0x42,0} }, { {0xe0,0x4B,0},{0xe0,0xF0,0x4B,0} }, { {          0},{               0} },        /*124*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*128*/
+    { {0xe0,0x1A,0},{0xe0,0xF0,0x1A,0} }, { {0xe0,0x22,0},{0xe0,0xF0,0x22,0} }, { {0xe0,0x21,0},{0xe0,0xF0,0x21,0} }, { {0xe0,0x2A,0},{0xe0,0xF0,0x2A,0} },        /*12c*/
+    { {0xe0,0x32,0},{0xe0,0xF0,0x32,0} }, { {0xe0,0x31,0},{0xe0,0xF0,0x31,0} }, { {0xe0,0x3A,0},{0xe0,0xF0,0x3A,0} }, { {          0},{               0} },        /*130*/
+    { {0xe0,0x49,0},{0xe0,0xF0,0x49,0} }, { {     0x77,0},{     0xf0,0x77,0} }, { {          0},{               0} }, { {     0x57,0},{     0xf0,0x57,0} },        /*134*/
+    { {     0x39,0},{     0xf0,0x39,0} }, { {          0},{               0} }, { {0xe0,0x58,0},{0xe0,0xF0,0x58,0} }, { {0xe0,0x05,0},{0xe0,0xF0,0x05,0} },        /*138*/
+    { {0xe0,0x06,0},{0xe0,0xF0,0x06,0} }, { {0xe0,0x04,0},{0xe0,0xF0,0x04,0} }, { {0xe0,0x0C,0},{0xe0,0xF0,0x0C,0} }, { {0xe0,0x03,0},{0xe0,0xF0,0x03,0} },        /*13c*/
+    { {0xe0,0x0B,0},{0xe0,0xF0,0x0B,0} }, { {0xe0,0x02,0},{0xe0,0xF0,0x02,0} }, { {0xe0,0x0A,0},{0xe0,0xF0,0x0A,0} }, { {0xe0,0x01,0},{0xe0,0xF0,0x01,0} },        /*140*/
+    { {0xe0,0x09,0},{0xe0,0xF0,0x09,0} }, { {          0},{               0} }, { {0xe0,0x7E,0},{0xe0,0xF0,0x7E,0} }, { {     0x6E,0},{     0xf0,0x6E,0} },        /*144*/
+    { {     0x63,0},{     0xf0,0x63,0} }, { {     0x6F,0},{     0xf0,0x6F,0} }, { {          0},{               0} }, { {     0x61,0},{     0xf0,0x61,0} },        /*148*/
+    { {0xe0,0x73,0},{0xe0,0xF0,0x73,0} }, { {     0x6A,0},{     0xf0,0x6A,0} }, { {0xe0,0x79,0},{0xe0,0xF0,0x79,0} }, { {     0x65,0},{     0xf0,0x65,0} },        /*14c*/
+    { {     0x60,0},{     0xf0,0x60,0} }, { {     0x6D,0},{     0xf0,0x6D,0} }, { {     0x67,0},{     0xf0,0x67,0} }, { {     0x64,0},{     0xf0,0x64,0} },        /*150*/
+    { {     0xd4,0},{     0xf0,0xD4,0} }, { {0xe0,0x60,0},{0xe0,0xF0,0x60,0} }, { {          0},{               0} }, { {0xe0,0x78,0},{0xe0,0xF0,0x78,0} },        /*154*/
+    { {0xe0,0x07,0},{0xe0,0xF0,0x07,0} }, { {0xe0,0x0F,0},{0xe0,0xF0,0x0F,0} }, { {0xe0,0x17,0},{0xe0,0xF0,0x17,0} }, { {     0x8B,0},{     0xf0,0x8B,0} },        /*158*/
+    { {     0x8C,0},{     0xf0,0x8C,0} }, { {     0x8D,0},{     0xf0,0x8D,0} }, { {          0},{               0} }, { {     0x7F,0},{     0xf0,0x7F,0} },        /*15c*/
+    { {          0},{               0} }, { {0xe0,0x4F,0},{0xe0,0xF0,0x4F,0} }, { {0xe0,0x56,0},{0xe0,0xF0,0x56,0} }, { {          0},{               0} },        /*160*/
+    { {0xe0,0x08,0},{0xe0,0xF0,0x08,0} }, { {0xe0,0x10,0},{0xe0,0xF0,0x10,0} }, { {0xe0,0x18,0},{0xe0,0xF0,0x18,0} }, { {0xe0,0x20,0},{0xe0,0xF0,0x20,0} },        /*164*/
+    { {0xe0,0x28,0},{0xe0,0xF0,0x28,0} }, { {0xe0,0x30,0},{0xe0,0xF0,0x30,0} }, { {0xe0,0x38,0},{0xe0,0xF0,0x38,0} }, { {0xe0,0x40,0},{0xe0,0xF0,0x40,0} },        /*168*/
+    { {0xe0,0x48,0},{0xe0,0xF0,0x48,0} }, { {0xe0,0x50,0},{0xe0,0xF0,0x50,0} }, { {0xe0,0x57,0},{0xe0,0xF0,0x57,0} }, { {          0},{               0} },        /*16c*/
+    { {0xe0,0x13,0},{0xe0,0xF0,0x13,0} }, { {0xe0,0x19,0},{0xe0,0xF0,0x19,0} }, { {0xe0,0x39,0},{0xe0,0xF0,0x39,0} }, { {0xe0,0x51,0},{0xe0,0xF0,0x51,0} },        /*170*/
+    { {0xe0,0x53,0},{0xe0,0xF0,0x53,0} }, { {0xe0,0x5C,0},{0xe0,0xF0,0x5C,0} }, { {          0},{               0} }, { {0xe0,0x62,0},{0xe0,0xF0,0x62,0} },        /*174*/
+    { {0xe0,0x63,0},{0xe0,0xF0,0x63,0} }, { {0xe0,0x64,0},{0xe0,0xF0,0x64,0} }, { {0xe0,0x65,0},{0xe0,0xF0,0x65,0} }, { {0xe0,0x67,0},{0xe0,0xF0,0x67,0} },        /*178*/
+    { {0xe0,0x68,0},{0xe0,0xF0,0x68,0} }, { {0xe0,0x6A,0},{0xe0,0xF0,0x6A,0} }, { {0xe0,0x6D,0},{0xe0,0xF0,0x6D,0} }, { {0xe0,0x6E,0},{0xe0,0xF0,0x6E,0} },        /*17c*/
+
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*180*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*184*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*188*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*18c*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*190*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*194*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*198*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*19c*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1a0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1a4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1a8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1ac*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1c0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1c4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1c8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1cc*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1d0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1d4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1d8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1dc*/
+    { {          0},{               0} }, { {0xe0,0xe1,0},{0xe0,0xF0,0xE1,0} }, { {          0},{               0} }, { {          0},{               0} },        /*1e0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1e4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1e8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {0xe0,0xee,0},{0xe0,0xF0,0xEE,0} }, { {          0},{               0} },        /*1ec*/
+    { {          0},{               0} }, { {0xe0,0xf1,0},{0xe0,0xF0,0xF1,0} }, { {          0},{               0} }, { {          0},{               0} },        /*1f0*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1f4*/
+    { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} }, { {          0},{               0} },        /*1f8*/
+    { {          0},{               0} }, { {          0},{               0} }, { {0xe0,0xfe,0},{0xe0,0xF0,0xFE,0} }, { {0xe0,0xff,0},{0xe0,0xF0,0xFF,0} }         /*1fc*/
+};
+
+
+#ifdef ENABLE_KEYBOARD_AT_LOG
+int keyboard_at_do_log = ENABLE_KEYBOARD_AT_LOG;
+
+
+static void
+kbd_log(const char *fmt, ...)
 {
-	keybsenddelay += (1000 * TIMER_USEC);
+    va_list ap;
 
-        if (keyboard_at.out_new != -1 && !keyboard_at.last_irq)
-        {
-                keyboard_at.wantirq = 0;
-                if (keyboard_at.out_new & 0x100)
-                {
-                        if (keyboard_at.mem[0] & 0x02)
-                                picint(0x1000);
-                        keyboard_at.out = keyboard_at.out_new & 0xff;
-                        keyboard_at.out_new = -1;
-                        keyboard_at.status |=  STAT_OFULL;
-                        keyboard_at.status &= ~STAT_IFULL;
-                        keyboard_at.status |=  STAT_MFULL;
-                        keyboard_at.last_irq = 0x1000;
-                }
-                else
-                {
-                        if (keyboard_at.mem[0] & 0x01)
-                                picint(2);
-                        keyboard_at.out = keyboard_at.out_new;
-                        keyboard_at.out_new = -1;
-                        keyboard_at.status |=  STAT_OFULL;
-                        keyboard_at.status &= ~STAT_IFULL;
-                        keyboard_at.status &= ~STAT_MFULL;
-                        keyboard_at.last_irq = 2;
-                }
-        }
+    if (keyboard_at_do_log) {
+	va_start(ap, fmt);
+	pclog_ex(fmt, ap);
+	va_end(ap);
+    }
+}
+#else
+#define kbd_log(fmt, ...)
+#endif
 
-        if (keyboard_at.out_new == -1 && !(keyboard_at.status & STAT_OFULL) && 
-            key_ctrl_queue_start != key_ctrl_queue_end)
-        {
-                keyboard_at.out_new = key_ctrl_queue[key_ctrl_queue_start];
-                key_ctrl_queue_start = (key_ctrl_queue_start + 1) & 0xf;
-        }                
-        else if (!(keyboard_at.status & STAT_OFULL) && keyboard_at.out_new == -1 && /*!(keyboard_at.mem[0] & 0x20) &&*/
-            mouse_queue_start != mouse_queue_end)
-        {
-                keyboard_at.out_new = mouse_queue[mouse_queue_start] | 0x100;
-                mouse_queue_start = (mouse_queue_start + 1) & 0xf;
-        }                
-        else if (!(keyboard_at.status & STAT_OFULL) && keyboard_at.out_new == -1 &&
-                 !(keyboard_at.mem[0] & 0x10) && key_queue_start != key_queue_end)
-        {
-                keyboard_at.out_new = key_queue[key_queue_start];
-                key_queue_start = (key_queue_start + 1) & 0xf;
-        }                
+
+static void
+set_scancode_map(atkbd_t *dev)
+{
+    switch (keyboard_mode & 3) {
+#ifdef USE_SET1
+	case 1:
+	default:
+		keyboard_set_table(scancode_set1);
+		break;
+#else
+	default:
+#endif
+	case 2:
+		keyboard_set_table(scancode_set2);
+		break;
+
+	case 3:
+		keyboard_set_table(scancode_set3);
+		break;
+    }
+
+    if (keyboard_mode & 0x20)
+#ifdef USE_SET1
+	keyboard_set_table(scancode_set1);
+#else
+	keyboard_set_table(scancode_set2);
+#endif
 }
 
-void keyboard_at_adddata(uint8_t val)
-{
-                key_ctrl_queue[key_ctrl_queue_end] = val;
-                key_ctrl_queue_end = (key_ctrl_queue_end + 1) & 0xf;
-}
 
-uint8_t sc_or = 0;
-
-void keyboard_at_adddata_keyboard(uint8_t val)
+static void
+kbd_poll(void *priv)
 {
-	/* Modification by OBattler: Allow for scan code translation. */
-	if ((mode & 0x40) && (val == 0xf0) && !(mode & 0x20))
-	{
-		sc_or = 0x80;
-		return;
+    atkbd_t *dev = (atkbd_t *)priv;
+
+    timer_advance_u64(&dev->send_delay_timer, (1000 * TIMER_USEC));
+
+    if ((dev->out_new != -1) && !dev->last_irq) {
+	dev->wantirq = 0;
+	if (dev->out_new & 0x100) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: want mouse data\n");
+#endif
+		if (dev->mem[0] & 0x02)
+			picint(0x1000);
+		dev->out = dev->out_new & 0xff;
+		dev->out_new = -1;
+		dev->status |=  STAT_OFULL;
+		dev->status &= ~STAT_IFULL;
+		dev->status |=  STAT_MFULL;
+		dev->last_irq = 0x1000;
+	} else {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: want keyboard data\n");
+#endif
+		if (dev->mem[0] & 0x01)
+			picint(2);
+		dev->out = dev->out_new & 0xff;
+		dev->out_new = -1;
+		dev->status |=  STAT_OFULL;
+		dev->status &= ~STAT_IFULL;
+		dev->status &= ~STAT_MFULL;
+		dev->last_irq = 2;
 	}
-	/* Skip break code if translated make code has bit 7 set. */
-	if ((mode & 0x40) && (sc_or == 0x80) && (nont_to_t[val] & 0x80) && !(mode & 0x20))
-	{
-		sc_or = 0;
-		return;
-	}
-        key_queue[key_queue_end] = (((mode & 0x40) && !(mode & 0x20)) ? (nont_to_t[val] | sc_or) : val);
-        key_queue_end = (key_queue_end + 1) & 0xf;
-	if (sc_or == 0x80)  sc_or = 0;
-        return;
+    }
+
+    if (dev->out_new == -1 && !(dev->status & STAT_OFULL) && key_ctrl_queue_start != key_ctrl_queue_end) {
+	dev->out_new = key_ctrl_queue[key_ctrl_queue_start] | 0x200;
+	key_ctrl_queue_start = (key_ctrl_queue_start + 1) & 0xf;
+    } else if (!(dev->status & STAT_OFULL) && dev->out_new == -1 && dev->out_delayed != -1) {
+            dev->out_new = dev->out_delayed;
+            dev->out_delayed = -1;
+    } else if (!(dev->status & STAT_OFULL) && dev->out_new == -1 && !(dev->mem[0] & 0x10) && dev->out_delayed != -1) {
+            dev->out_new = dev->out_delayed;
+            dev->out_delayed = -1;
+    } else if (!(dev->status & STAT_OFULL) && dev->out_new == -1/* && !(dev->mem[0] & 0x20)*/ &&
+	    (mouse_queue_start != mouse_queue_end)) {
+	dev->out_new = mouse_queue[mouse_queue_start] | 0x100;
+	mouse_queue_start = (mouse_queue_start + 1) & 0xf;
+    } else if (!(dev->status&STAT_OFULL) && dev->out_new == -1 &&
+	       !(dev->mem[0]&0x10) && (key_queue_start != key_queue_end)) {
+	dev->out_new = key_queue[key_queue_start];
+	key_queue_start = (key_queue_start + 1) & 0xf;
+    }
 }
 
-void keyboard_at_adddata_keyboard_raw(uint8_t val)
+
+static void
+add_data(atkbd_t *dev, uint8_t val)
 {
-        key_queue[key_queue_end] = val;
-        key_queue_end = (key_queue_end + 1) & 0xf;
-        return;
+    key_ctrl_queue[key_ctrl_queue_end] = val;
+    key_ctrl_queue_end = (key_ctrl_queue_end + 1) & 0xf;
+
+    if (! (dev->out_new & 0x300)) {
+	dev->out_delayed = dev->out_new;
+	dev->out_new = -1;
+    }
 }
 
-void keyboard_at_adddata_mouse(uint8_t val)
+
+static void
+add_data_vals(atkbd_t *dev, uint8_t *val, uint8_t len)
 {
-        mouse_queue[mouse_queue_end] = val;
-        mouse_queue_end = (mouse_queue_end + 1) & 0xf;
-        return;
+    int xt_mode = (keyboard_mode & 0x20) && ((dev->flags & KBC_TYPE_MASK) < KBC_TYPE_PS2_NOREF);
+    int translate = (keyboard_mode & 0x40);
+    int i;
+    uint8_t or = 0;
+    uint8_t send;
+
+    translate = translate || (keyboard_mode & 0x40) || xt_mode;
+    translate = translate || ((dev->flags & KBC_TYPE_MASK) == KBC_TYPE_PS2_2);
+
+    for (i = 0; i < len; i++) {
+        if (translate) {
+		if (val[i] == 0xf0) {
+			or = 0x80;
+			continue;
+		}
+		send = nont_to_t[val[i]] | or;
+		if (or == 0x80)
+			or = 0;
+	} else
+		send = val[i];
+#ifdef ENABLE_KEYBOARD_AT_LOG
+	kbd_log("%02X", send);
+#endif
+	key_queue[key_queue_end] = send;
+	key_queue_end = (key_queue_end + 1) & 0xf;
+#ifdef ENABLE_KEYBOARD_AT_LOG
+	if (i < (len - 1))  kbd_log(" ");
+#endif
+    }
+
+#ifdef ENABLE_KEYBOARD_AT_LOG
+    if (translate) {
+	kbd_log(" original: (");
+    	for (i = 0; i < len; i++) {
+		kbd_log("%02X", val[i]);
+		if (i < (len - 1))  kbd_log(" ");
+    	}
+	kbd_log(")");
+    }
+    kbd_log("\n");
+#endif
 }
 
-void keyboard_at_write(uint16_t port, uint8_t val, void *priv)
+
+static void
+add_data_kbd(uint16_t val)
 {
-	int i = 0;
-        switch (port)
-        {
-                case 0x60:
-                if (keyboard_at.want60)
-                {
-                        /*Write to controller*/
-                        keyboard_at.want60 = 0;
-                        switch (keyboard_at.command)
-                        {
-				/* 0x40 - 0x5F are aliases for 0x60-0x7F */
-                                case 0x40: case 0x41: case 0x42: case 0x43:
-                                case 0x44: case 0x45: case 0x46: case 0x47:
-                                case 0x48: case 0x49: case 0x4a: case 0x4b:
-                                case 0x4c: case 0x4d: case 0x4e: case 0x4f:
-                                case 0x50: case 0x51: case 0x52: case 0x53:
-                                case 0x54: case 0x55: case 0x56: case 0x57:
-                                case 0x58: case 0x59: case 0x5a: case 0x5b:
-                                case 0x5c: case 0x5d: case 0x5e: case 0x5f:
-				keyboard_at.command |= 0x20;
-				goto write_register;
+    atkbd_t *dev = SavedKbd;
+    int xt_mode = (keyboard_mode & 0x20) && ((dev->flags & KBC_TYPE_MASK) < KBC_TYPE_PS2_NOREF);
+    int translate = (keyboard_mode & 0x40);
+    uint8_t fake_shift[4];
+    uint8_t num_lock = 0, shift_states = 0;
 
-                                case 0x60: case 0x61: case 0x62: case 0x63:
-                                case 0x64: case 0x65: case 0x66: case 0x67:
-                                case 0x68: case 0x69: case 0x6a: case 0x6b:
-                                case 0x6c: case 0x6d: case 0x6e: case 0x6f:
-                                case 0x70: case 0x71: case 0x72: case 0x73:
-                                case 0x74: case 0x75: case 0x76: case 0x77:
-                                case 0x78: case 0x79: case 0x7a: case 0x7b:
-                                case 0x7c: case 0x7d: case 0x7e: case 0x7f:
+    translate = translate || (keyboard_mode & 0x40) || xt_mode;
+    translate = translate || ((dev->flags & KBC_TYPE_MASK) == KBC_TYPE_PS2_2);
 
-write_register:
-                                keyboard_at.mem[keyboard_at.command & 0x1f] = val;
-                                if (keyboard_at.command == 0x60)
-                                {
-                                        if ((val & 1) && (keyboard_at.status & STAT_OFULL))
-                                           keyboard_at.wantirq = 1;
-                                        if (!(val & 1) && keyboard_at.wantirq)
-                                           keyboard_at.wantirq = 0;
-                                        mouse_scan = !(val & 0x20);
+    keyboard_get_states(NULL, &num_lock, NULL);
+    shift_states = keyboard_get_shift() & STATE_SHIFT_MASK;
 
-					/* Addition by OBattler: Scan code translate ON/OFF. */
-					mode &= 0x93;
-					mode |= (val & MODE_MASK);
-					if (first_write)
-					{
-						/* A bit of a hack, but it will make the keyboard behave correctly, regardless
-						   of what the BIOS sets here. */
-						mode &= 0xFC;
-						dtrans = mode & (CCB_TRANSLATE | CCB_PCMODE);
-						if ((mode & (CCB_TRANSLATE | CCB_PCMODE)) == CCB_TRANSLATE)
-						{
-							/* Bit 6 on, bit 5 off, the only case in which translation is on,
-							   therefore, set to set 2. */
-							mode |= 2;
-						}
-						keyboard_at.default_mode = (mode & 3);
-						first_write = 0;
-						/* No else because in all other cases, translation is off, so we need to keep it
-						   set to set 0 which the mode &= 0xFC above will set it. */
-					}
-                                }                                           
-                                break;
+    /* Allow for scan code translation. */
+    if (translate && (val == 0xf0)) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+	kbd_log("ATkbd: translate is on, F0 prefix detected\n");
+#endif
+	sc_or = 0x80;
+	return;
+    }
 
-				case 0xaf: /*AMI - set extended controller RAM*/
-				if (keyboard_at.secr_phase == 0)
-				{
-					goto bad_command;
-				}
-				else if (keyboard_at.secr_phase == 1)
-				{
-					keyboard_at.mem_addr = val;
-					keyboard_at.want60 = 1;
-					keyboard_at.secr_phase = 2;
-				}
-				else if (keyboard_at.secr_phase == 2)
-				{
-					keyboard_at.mem[keyboard_at.mem_addr] = val;
-					keyboard_at.secr_phase = 0;
-				}
+    /* Skip break code if translated make code has bit 7 set. */
+    if (translate && (sc_or == 0x80) && (val & 0x80)) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+	kbd_log("ATkbd: translate is on, skipping scan code: %02X (original: F0 %02X)\n", nont_to_t[val], val);
+#endif
+	sc_or = 0;
+	return;
+    }
+
+    /* Test for T3100E 'Fn' key (Right Alt / Right Ctrl) */
+    if ((dev != NULL) &&
+        ((dev->flags & KBC_VEN_MASK) == KBC_VEN_TOSHIBA) &&
+	(keyboard_recv(0xb8) || keyboard_recv(0x9d))) switch (val) {
+	case 0x4f: t3100e_notify_set(0x01); break; /* End */
+	case 0x50: t3100e_notify_set(0x02); break; /* Down */
+	case 0x51: t3100e_notify_set(0x03); break; /* PgDn */
+	case 0x52: t3100e_notify_set(0x04); break; /* Ins */
+	case 0x53: t3100e_notify_set(0x05); break; /* Del */
+	case 0x54: t3100e_notify_set(0x06); break; /* SysRQ */
+	case 0x45: t3100e_notify_set(0x07); break; /* NumLock */
+	case 0x46: t3100e_notify_set(0x08); break; /* ScrLock */
+	case 0x47: t3100e_notify_set(0x09); break; /* Home */
+	case 0x48: t3100e_notify_set(0x0a); break; /* Up */
+	case 0x49: t3100e_notify_set(0x0b); break; /* PgUp */
+	case 0x4A: t3100e_notify_set(0x0c); break; /* Keypad -*/
+	case 0x4B: t3100e_notify_set(0x0d); break; /* Left */
+	case 0x4C: t3100e_notify_set(0x0e); break; /* KP 5 */
+	case 0x4D: t3100e_notify_set(0x0f); break; /* Right */
+    }
+
+#ifdef ENABLE_KEYBOARD_AT_LOG
+    kbd_log("ATkbd: translate is %s, ", translate ? "on" : "off");
+#endif
+    switch(val) {
+	case FAKE_LSHIFT_ON:
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("fake left shift on, scan code: ");
+#endif
+		if (num_lock) {
+			if (shift_states) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+				kbd_log("N/A (one or both shifts on)\n");
+#endif
 				break;
+			} else {
+				/* Num lock on and no shifts are pressed, send non-inverted fake shift. */
+				switch(keyboard_mode & 0x02) {
+					case 1:
+						fake_shift[0] = 0xe0; fake_shift[1] = 0x2a;
+						add_data_vals(dev, fake_shift, 2);
+						break;
 
-                                case 0xcb: /*AMI - set keyboard mode*/
-                                break;
-                                
-                                case 0xcf: /*??? - sent by MegaPC BIOS*/
-				/* To make sure the keyboard works correctly on the MegaPC. */
-				mode &= 0xFC;
-				mode |= 2;
-                                break;
-                                
-                                case 0xd1: /*Write output port*/
-                                if ((keyboard_at.output_port ^ val) & 0x02) /*A20 enable change*/
-                                {
-                                        mem_a20_key = val & 0x02;
-                                        mem_a20_recalc();
-                                        flushmmucache();
-                                }
-                                keyboard_at.output_port = val;
-                                break;
-                                
-                                case 0xd2: /*Write to keyboard output buffer*/
-                                keyboard_at_adddata_keyboard(val);
-                                break;
-                                
-                                case 0xd3: /*Write to mouse output buffer*/
-                                keyboard_at_adddata_mouse(val);
-                                break;
-                                
-                                case 0xd4: /*Write to mouse*/
-                                if (keyboard_at.mouse_write)
-                                        keyboard_at.mouse_write(val, keyboard_at.mouse_p);
-                                break;     
-                                
-                                default:
-bad_command:
-                                pclog("Bad AT keyboard controller 0060 write %02X command %02X\n", val, keyboard_at.command);
-                        }
-                }
-                else
-                {
-                        /*Write to keyboard*/                        
-                        keyboard_at.mem[0] &= ~0x10;
-                        if (keyboard_at.key_wantdata)
-                        {
-                                keyboard_at.key_wantdata = 0;
-                                switch (keyboard_at.key_command)
-                                {
-                                        case 0xed: /*Set/reset LEDs*/
-                                        keyboard_at_adddata_keyboard(0xfa);
-                                        break;
+					case 2:
+						fake_shift[0] = 0xe0; fake_shift[1] = 0x12;
+						add_data_vals(dev, fake_shift, 2);
+						break;
 
-					case 0xf0: /*Get/set scancode set*/
-					if (val == 0)
-					{
-						keyboard_at_adddata_keyboard(mode & 3);
+					default:
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("N/A (scan code set %i)\n", keyboard_mode & 0x02);
+#endif
+						break;
+				}
+			}
+		} else {
+			if (shift_states & STATE_LSHIFT) {
+				/* Num lock off and left shift pressed. */
+				switch(keyboard_mode & 0x02) {
+					case 1:
+						fake_shift[0] = 0xe0; fake_shift[1] = 0xaa;
+						add_data_vals(dev, fake_shift, 2);
+						break;
+
+					case 2:
+						fake_shift[0] = 0xe0; fake_shift[1] = 0xf0; fake_shift[2] = 0x12;
+						add_data_vals(dev, fake_shift, 3);
+						break;
+
+					default:
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("N/A (scan code set %i)\n", keyboard_mode & 0x02);
+#endif
+						break;
+				}
+			}
+			if (shift_states & STATE_RSHIFT) {
+				/* Num lock off and right shift pressed. */
+				switch(keyboard_mode & 0x02) {
+					case 1:
+						fake_shift[0] = 0xe0; fake_shift[1] = 0xb6;
+						add_data_vals(dev, fake_shift, 2);
+						break;
+
+					case 2:
+						fake_shift[0] = 0xe0; fake_shift[1] = 0xf0; fake_shift[2] = 0x59;
+						add_data_vals(dev, fake_shift, 3);
+						break;
+
+					default:
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("N/A (scan code set %i)\n", keyboard_mode & 0x02);
+#endif
+						break;
+				}
+			}
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			if (!shift_states)
+				kbd_log("N/A (both shifts off)\n");
+#endif
+		}
+		break;
+
+	case FAKE_LSHIFT_OFF:
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("fake left shift on, scan code: ");
+#endif
+		if (num_lock) {
+			if (shift_states) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+				kbd_log("N/A (one or both shifts on)\n");
+#endif
+				break;
+			} else {
+				/* Num lock on and no shifts are pressed, send non-inverted fake shift. */
+				switch(keyboard_mode & 0x02) {
+					case 1:
+						fake_shift[0] = 0xe0; fake_shift[1] = 0xaa;
+						add_data_vals(dev, fake_shift, 2);
+						break;
+
+					case 2:
+						fake_shift[0] = 0xe0; fake_shift[1] = 0xf0; fake_shift[2] = 0x12;
+						add_data_vals(dev, fake_shift, 3);
+						break;
+
+					default:
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("N/A (scan code set %i)\n", keyboard_mode & 0x02);
+#endif
+						break;
+				}
+			}
+		} else {
+			if (shift_states & STATE_LSHIFT) {
+				/* Num lock off and left shift pressed. */
+				switch(keyboard_mode & 0x02) {
+					case 1:
+						fake_shift[0] = 0xe0; fake_shift[1] = 0x2a;
+						add_data_vals(dev, fake_shift, 2);
+						break;
+
+					case 2:
+						fake_shift[0] = 0xe0; fake_shift[1] = 0x12;
+						add_data_vals(dev, fake_shift, 2);
+						break;
+
+					default:
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("N/A (scan code set %i)\n", keyboard_mode & 0x02);
+#endif
+						break;
+				}
+			}
+			if (shift_states & STATE_RSHIFT) {
+				/* Num lock off and right shift pressed. */
+				switch(keyboard_mode & 0x02) {
+					case 1:
+						fake_shift[0] = 0xe0; fake_shift[1] = 0x36;
+						add_data_vals(dev, fake_shift, 2);
+						break;
+
+					case 2:
+						fake_shift[0] = 0xe0; fake_shift[1] = 0x59;
+						add_data_vals(dev, fake_shift, 2);
+						break;
+
+					default:
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("N/A (scan code set %i)\n", keyboard_mode & 0x02);
+#endif
+						break;
+				}
+			}
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			if (!shift_states)
+				kbd_log("N/A (both shifts off)\n");
+#endif
+		}
+		break;
+
+	default:
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("scan code: ");
+		if (translate) {
+			kbd_log("%02X (original: ", (nont_to_t[val] | sc_or));
+			if (sc_or == 0x80)
+				kbd_log("F0 ");
+			kbd_log("%02X)\n", val);
+		} else
+			kbd_log("%02X\n", val);
+#endif
+
+		key_queue[key_queue_end] = (translate ? (nont_to_t[val] | sc_or) : val);
+		key_queue_end = (key_queue_end + 1) & 0xf;
+		break;
+    }
+
+    if (sc_or == 0x80)
+	sc_or = 0;
+}
+
+
+static void
+write_output(atkbd_t *dev, uint8_t val)
+{
+#ifdef ENABLE_KEYBOARD_AT_LOG
+    kbd_log("ATkbd: write output port: %02X (old: %02X)\n", val, dev->output_port);
+#endif
+
+    if ((dev->output_port ^ val) & 0x20) { /*IRQ 12*/
+	if (val & 0x20)
+		picint(1 << 12);
+	else
+		picintc(1 << 12);
+    }
+    if ((dev->output_port ^ val) & 0x10) { /*IRQ 1*/
+	if (val & 0x10)
+		picint(1 << 1);
+	else
+		picintc(1 << 1);
+    }
+    if ((dev->output_port ^ val) & 0x02) { /*A20 enable change*/
+	mem_a20_key = val & 0x02;
+	mem_a20_recalc();
+	flushmmucache();
+    }
+    if ((dev->output_port ^ val) & 0x01) { /*Reset*/
+	if (! (val & 0x01)) {
+		/* Pin 0 selected. */
+		softresetx86(); /*Pulse reset!*/
+		cpu_set_edx();
+	}
+    }
+    dev->output_port = val;
+}
+
+
+static void
+write_cmd(atkbd_t *dev, uint8_t val)
+{
+#ifdef ENABLE_KEYBOARD_AT_LOG
+    kbd_log("ATkbd: write command byte: %02X (old: %02X)\n", val, dev->mem[0]);
+#endif
+
+    if ((val & 1) && (dev->status & STAT_OFULL))
+	dev->wantirq = 1;
+    if (!(val & 1) && dev->wantirq)
+	dev->wantirq = 0;
+
+    /* PS/2 type 2 keyboard controllers always force the XLAT bit to 0. */
+    if ((dev->flags & KBC_TYPE_MASK) == KBC_TYPE_PS2_2) {
+	val &= ~CCB_TRANSLATE;
+	dev->mem[0] &= ~CCB_TRANSLATE;
+    }
+
+    /* Scan code translate ON/OFF. */
+    keyboard_mode &= 0x93;
+    keyboard_mode |= (val & MODE_MASK);
+
+    keyboard_scan = !(val & 0x10);
+#ifdef ENABLE_KEYBOARD_AT_LOG
+    kbd_log("ATkbd: keyboard is now %s\n",  keyboard_scan ? "enabled" : "disabled");
+    kbd_log("ATkbd: keyboard interrupt is now %s\n",  (val & 0x01) ? "enabled" : "disabled");
+#endif
+
+    /* ISA AT keyboard controllers use bit 5 for keyboard mode (1 = PC/XT, 2 = AT);
+       PS/2 (and EISA/PCI) keyboard controllers use it as the PS/2 mouse enable switch. */
+    if (((dev->flags & KBC_VEN_MASK) == KBC_VEN_AMI) ||
+        ((dev->flags & KBC_TYPE_MASK) >= KBC_TYPE_PS2_NOREF)) {
+	keyboard_mode &= ~CCB_PCMODE;
+
+	mouse_scan = !(val & 0x20);
+#ifdef ENABLE_KEYBOARD_AT_LOG
+	kbd_log("ATkbd: mouse is now %s\n",  mouse_scan ? "enabled" : "disabled");
+
+	kbd_log("ATkbd: mouse interrupt is now %s\n",  (val & 0x02) ? "enabled" : "disabled");
+#endif
+    }
+
+    kbd_log("Command byte now: %02X (%02X)\n", dev->mem[0], val);
+}
+
+
+static void
+pulse_output(atkbd_t *dev, uint8_t mask)
+{
+    if (mask != 0x0f) {
+    	dev->old_output_port = dev->output_port & ~(0xf0 | mask);
+    	write_output(dev, dev->output_port & (0xf0 | mask));
+    	timer_set_delay_u64(&dev->pulse_cb, 6ULL * TIMER_USEC);
+    }
+}
+
+
+static void
+pulse_poll(void *priv)
+{
+    atkbd_t *dev = (atkbd_t *)priv;
+
+    write_output(dev, dev->output_port | dev->old_output_port);
+}
+
+
+static void
+set_enable_kbd(atkbd_t *dev, uint8_t enable)
+{
+    dev->mem[0] &= 0xef;
+    dev->mem[0] |= (enable ? 0x00 : 0x10);
+
+    keyboard_scan = enable;
+}
+
+
+static void
+set_enable_mouse(atkbd_t *dev, uint8_t enable)
+{
+    dev->mem[0] &= 0xdf;
+    dev->mem[0] |= (enable ? 0x00 : 0x20);
+
+    mouse_scan = enable;
+}
+
+
+static uint8_t
+write64_generic(void *priv, uint8_t val)
+{
+    atkbd_t *dev = (atkbd_t *)priv;
+    uint8_t current_drive;
+
+    switch (val) {
+	case 0xa4:	/* check if password installed */
+		if ((dev->flags & KBC_TYPE_MASK) >= KBC_TYPE_PS2_NOREF) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			kbd_log("ATkbd: check if password installed\n");
+#endif
+			add_data(dev, 0xf1);
+			return 0;
+		}
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		else
+			kbd_log("ATkbd: bad command A4\n");
+#endif
+		break;
+
+	case 0xa7:	/* disable mouse port */
+		if ((dev->flags & KBC_TYPE_MASK) >= KBC_TYPE_PS2_NOREF) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			kbd_log("ATkbd: disable mouse port\n");
+#endif
+			set_enable_mouse(dev, 0);
+			return 0;
+		}
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		else
+			kbd_log("ATkbd: bad command A7\n");
+#endif
+		break;
+
+	case 0xa8:	/*Enable mouse port*/
+		if ((dev->flags & KBC_TYPE_MASK) >= KBC_TYPE_PS2_NOREF) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			kbd_log("ATkbd: enable mouse port\n");
+#endif
+			set_enable_mouse(dev, 1);
+			return 0;
+		}
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		else
+			kbd_log("ATkbd: bad command A8\n");
+#endif
+		break;
+
+	case 0xa9:	/*Test mouse port*/
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: test mouse port\n");
+#endif
+		if ((dev->flags & KBC_TYPE_MASK) >= KBC_TYPE_PS2_NOREF) {
+			if (mouse_write)
+				add_data(dev, 0x00); /* no error */
+			else
+				add_data(dev, 0xff); /* no mouse */
+			return 0;
+		}
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		else
+			kbd_log("ATkbd: bad command A9\n");
+#endif
+		break;
+
+	case 0xaf:	/* read keyboard version */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: read keyboard version\n");
+#endif
+		add_data(dev, 0x00);
+		return 0;
+
+	case 0xc0:	/* read input port */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: read input port\n");
+#endif
+		if ((dev->flags & KBC_VEN_MASK) == KBC_VEN_IBM_PS1) {
+			current_drive = fdc_get_current_drive();
+			add_data(dev, dev->input_port | 4 | (fdd_is_525(current_drive) ? 0x40 : 0x00));
+			dev->input_port = ((dev->input_port + 1) & 3) |
+					   (dev->input_port & 0xfc) |
+					   (fdd_is_525(current_drive) ? 0x40 : 0x00);
+		} else {
+			if ((dev->flags & KBC_TYPE_MASK) >= KBC_TYPE_PS2_NOREF)
+				add_data(dev, (dev->input_port | 4) & 0xef);
+			else
+				add_data(dev, dev->input_port | 4);
+			dev->input_port = ((dev->input_port + 1) & 3) |
+					   (dev->input_port & 0xfc);
+		}
+		return 0;
+
+	case 0xd3:	/* write mouse output buffer */
+		if ((dev->flags & KBC_TYPE_MASK) >= KBC_TYPE_PS2_NOREF) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			kbd_log("ATkbd: write mouse output buffer\n");
+#endif
+			dev->want60 = 1;
+			return 0;
+		}
+		break;
+
+	case 0xd4:	/* write to mouse */
+#if 0
+		if ((dev->flags & KBC_TYPE_MASK) >= KBC_TYPE_PS2_NOREF) {
+#endif
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			kbd_log("ATkbd: write to mouse\n");
+#endif
+			dev->want60 = 1;
+			return 0;
+#if 0
+		}
+		break;
+#endif
+
+	case 0xf0: case 0xf1: case 0xf2: case 0xf3:
+	case 0xf4: case 0xf5: case 0xf6: case 0xf7:
+	case 0xf8: case 0xf9: case 0xfa: case 0xfb:
+	case 0xfc: case 0xfd: case 0xfe: case 0xff:
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: pulse %01X\n", val & 0x0f);
+#endif
+		pulse_output(dev, val & 0x0f);
+		return 0;
+    }
+
+    return 1;
+}
+
+
+static uint8_t
+write60_acer(void *priv, uint8_t val)
+{
+#if 0
+    atkbd_t *dev = (atkbd_t *)priv;
+
+    switch(dev->command) {
+	case 0xc0:	/* sent by Acer V30 BIOS */
+		return 0;
+    }
+#endif
+
+    return 1;
+}
+
+
+static uint8_t
+write64_acer(void *priv, uint8_t val)
+{
+    atkbd_t *dev = (atkbd_t *)priv;
+
+    kbd_log("ACER: write64(%02x, %02x)\n", dev->command, val);
+
+#if 0
+    switch (val) {
+	case 0xc0:	/* sent by Acer V30 BIOS */
+		return 0;
+    }
+#endif
+
+    return write64_generic(dev, val);
+}
+
+
+static uint8_t
+write60_ami(void *priv, uint8_t val)
+{
+    atkbd_t *dev = (atkbd_t *)priv;
+
+    switch(dev->command) {
+	/* 0x40 - 0x5F are aliases for 0x60-0x7F */
+	case 0x40: case 0x41: case 0x42: case 0x43:
+	case 0x44: case 0x45: case 0x46: case 0x47:
+	case 0x48: case 0x49: case 0x4a: case 0x4b:
+	case 0x4c: case 0x4d: case 0x4e: case 0x4f:
+	case 0x50: case 0x51: case 0x52: case 0x53:
+	case 0x54: case 0x55: case 0x56: case 0x57:
+	case 0x58: case 0x59: case 0x5a: case 0x5b:
+	case 0x5c: case 0x5d: case 0x5e: case 0x5f:
+		kbd_log("ATkbd: AMI - alias write to %08X\n", dev->command);
+		dev->mem[dev->command & 0x1f] = val;
+		if (dev->command == 0x60)
+			write_cmd(dev, val);
+		return 0;
+
+	case 0xaf:	/* set extended controller RAM */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: AMI - set extended controller RAM\n");
+#endif
+		if (dev->secr_phase == 1) {
+			dev->mem_addr = val;
+			dev->want60 = 1;
+			dev->secr_phase = 2;
+		} else if (dev->secr_phase == 2) {
+			dev->mem[dev->mem_addr] = val;
+			dev->secr_phase = 0;
+		}
+		return 0;
+
+	case 0xcb:	/* set keyboard mode */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: AMI - set keyboard mode\n");
+#endif
+		return 0;
+    }
+
+    return 1;
+}
+
+
+static uint8_t
+write64_ami(void *priv, uint8_t val)
+{
+    atkbd_t *dev = (atkbd_t *)priv;
+
+    switch (val) {
+	case 0x00: case 0x01: case 0x02: case 0x03:
+	case 0x04: case 0x05: case 0x06: case 0x07:
+	case 0x08: case 0x09: case 0x0a: case 0x0b:
+	case 0x0c: case 0x0d: case 0x0e: case 0x0f:
+	case 0x10: case 0x11: case 0x12: case 0x13:
+	case 0x14: case 0x15: case 0x16: case 0x17:
+	case 0x18: case 0x19: case 0x1a: case 0x1b:
+	case 0x1c: case 0x1d: case 0x1e: case 0x1f:
+		kbd_log("ATkbd: AMI - alias read from %08X\n", val);
+		add_data(dev, dev->mem[val]);
+		return 0;
+
+	case 0x40: case 0x41: case 0x42: case 0x43:
+	case 0x44: case 0x45: case 0x46: case 0x47:
+	case 0x48: case 0x49: case 0x4a: case 0x4b:
+	case 0x4c: case 0x4d: case 0x4e: case 0x4f:
+	case 0x50: case 0x51: case 0x52: case 0x53:
+	case 0x54: case 0x55: case 0x56: case 0x57:
+	case 0x58: case 0x59: case 0x5a: case 0x5b:
+	case 0x5c: case 0x5d: case 0x5e: case 0x5f:
+		kbd_log("ATkbd: AMI - alias write to %08X\n", dev->command);
+		dev->want60 = 1;
+		return 0;
+
+	case 0xa1:	/* get controller version */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: AMI - get controller version\n");
+#endif
+		return 0;
+
+	case 0xa2:	/* clear keyboard controller lines P22/P23 */
+		if ((dev->flags & KBC_TYPE_MASK) < KBC_TYPE_PS2_NOREF) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			kbd_log("ATkbd: AMI - clear KBC lines P22 and P23\n");
+#endif
+			write_output(dev, dev->output_port & 0xf3);
+			add_data(dev, 0x00);
+			return 0;
+		}
+		break;
+
+	case 0xa3:	/* set keyboard controller lines P22/P23 */
+		if ((dev->flags & KBC_TYPE_MASK) < KBC_TYPE_PS2_NOREF) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			kbd_log("ATkbd: AMI - set KBC lines P22 and P23\n");
+#endif
+			write_output(dev, dev->output_port | 0x0c);
+			add_data(dev, 0x00);
+			return 0;
+		}
+		break;
+
+	case 0xa4:	/* write clock = low */
+		if ((dev->flags & KBC_TYPE_MASK) < KBC_TYPE_PS2_NOREF) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			kbd_log("ATkbd: AMI - write clock = low\n");
+#endif
+			dev->ami_stat &= 0xfe;
+			return 0;
+		}
+		break;
+
+	case 0xa5:	/* write clock = high */
+		if ((dev->flags & KBC_TYPE_MASK) < KBC_TYPE_PS2_NOREF) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			kbd_log("ATkbd: AMI - write clock = high\n");
+#endif
+			dev->ami_stat |= 0x01;
+			return 0;
+		}
+		break;
+
+	case 0xa6:	/* read clock */
+		if ((dev->flags & KBC_TYPE_MASK) < KBC_TYPE_PS2_NOREF) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			kbd_log("ATkbd: AMI - read clock\n");
+#endif
+			add_data(dev, !!(dev->ami_stat & 1));
+			return 0;
+		}
+		break;
+
+	case 0xa7:	/* write cache bad */
+		if ((dev->flags & KBC_TYPE_MASK) < KBC_TYPE_PS2_NOREF) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			kbd_log("ATkbd: AMI - write cache bad\n");
+#endif
+			dev->ami_stat &= 0xfd;
+			return 0;
+		}
+		break;
+
+	case 0xa8:	/* write cache good */
+		if ((dev->flags & KBC_TYPE_MASK) < KBC_TYPE_PS2_NOREF) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			kbd_log("ATkbd: AMI - write cache good\n");
+#endif
+			dev->ami_stat |= 0x02;
+			return 0;
+		}
+		break;
+
+	case 0xa9:	/* read cache */
+		if ((dev->flags & KBC_TYPE_MASK) < KBC_TYPE_PS2_NOREF) {
+#ifdef ENABLE_KEYBOARD_AT_LOG
+			kbd_log("ATkbd: AMI - read cache\n");
+#endif
+			add_data(dev, !!(dev->ami_stat & 2));
+			return 0;
+		}
+		break;
+
+	case 0xaf:	/* set extended controller RAM */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: set extended controller RAM\n");
+#endif
+		dev->want60 = 1;
+		dev->secr_phase = 1;
+		return 0;
+
+	case 0xb0: case 0xb1: case 0xb2: case 0xb3:
+		/* set KBC lines P10-P13 (input port bits 0-3) low */
+		if (!PCI || (val > 0xb1))
+			dev->input_port &= ~(1 << (val & 0x03));
+		add_data(dev, 0x00);
+		return 0;
+
+	case 0xb4: case 0xb5:
+		/* set KBC lines P22-P23 (output port bits 2-3) low */
+		if (! PCI)
+			write_output(dev, dev->output_port & ~(4 << (val & 0x01)));
+		add_data(dev, 0x00);
+		return 0;
+
+	case 0xb8: case 0xb9: case 0xba: case 0xbb:
+		/* set KBC lines P10-P13 (input port bits 0-3) high */
+		if (!PCI || (val > 0xb9)) {
+			dev->input_port |= (1 << (val & 0x03));
+			add_data(dev, 0x00);
+		}
+		return 0;
+
+	case 0xbc: case 0xbd:
+		/* set KBC lines P22-P23 (output port bits 2-3) high */
+		if (! PCI)
+			write_output(dev, dev->output_port | (4 << (val & 0x01)));
+		add_data(dev, 0x00);
+		return 0;
+
+	case 0xc8:
+		/*
+		 * unblock KBC lines P22/P23
+		 * (allow command D1 to change bits 2/3 of the output port)
+		 */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: AMI - unblock KBC lines P22 and P23\n");
+#endif
+		dev->output_locked = 1;
+		return 0;
+
+	case 0xc9:
+		/*
+		 * block KBC lines P22/P23
+		 * (disallow command D1 from changing bits 2/3 of the port)
+		 */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: AMI - block KBC lines P22 and P23\n");
+#endif
+		dev->output_locked = 1;
+		return 0;
+
+	case 0xca:	/* read keyboard mode */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: AMI - read keyboard mode\n");
+#endif
+		add_data(dev, 0x00); /*ISA mode*/
+		return 0;
+
+	case 0xcb:	/* set keyboard mode */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: AMI - set keyboard mode\n");
+#endif
+		dev->want60 = 1;
+		return 0;
+
+	case 0xef:	/* ??? - sent by AMI486 */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: ??? - sent by AMI486\n");
+#endif
+		return 0;
+    }
+
+    return write64_generic(dev, val);
+}
+
+
+static uint8_t
+write64_ibm_mca(void *priv, uint8_t val)
+{
+    atkbd_t *dev = (atkbd_t *)priv;
+
+    switch (val) {
+	case 0xc1: /*Copy bits 0 to 3 of input port to status bits 4 to 7*/
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: copy bits 0 to 3 of input port to status bits 4 to 7\n");
+#endif
+		dev->status &= 0x0f;
+		dev->status |= ((((dev->input_port & 0xfc) | 0x84) & 0x0f) << 4);
+		return 0;
+
+	case 0xc2: /*Copy bits 4 to 7 of input port to status bits 4 to 7*/
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: copy bits 4 to 7 of input port to status bits 4 to 7\n");
+#endif
+		dev->status &= 0x0f;
+		dev->status |= (((dev->input_port & 0xfc) | 0x84) & 0xf0);
+		return 0;
+
+	case 0xaf:
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: bad KBC command AF\n");
+#endif
+		return 1;
+
+	case 0xf0: case 0xf1: case 0xf2: case 0xf3:
+	case 0xf4: case 0xf5: case 0xf6: case 0xf7:
+	case 0xf8: case 0xf9: case 0xfa: case 0xfb:
+	case 0xfc: case 0xfd: case 0xfe: case 0xff:
+		kbd_log("ATkbd: pulse: %01X\n", (val & 0x03) | 0x0c);
+		pulse_output(dev, (val & 0x03) | 0x0c);
+		return 0;
+    }
+
+    return write64_generic(dev, val);
+}
+
+
+static uint8_t
+write60_quadtel(void *priv, uint8_t val)
+{
+    atkbd_t *dev = (atkbd_t *)priv;
+
+    switch(dev->command) {
+	case 0xcf:	/*??? - sent by MegaPC BIOS*/
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: ??? - sent by MegaPC BIOS\n");
+#endif
+		return 0;
+    }
+
+    return 1;
+}
+
+
+static uint8_t
+write64_quadtel(void *priv, uint8_t val)
+{
+    atkbd_t *dev = (atkbd_t *)priv;
+
+    switch (val) {
+	case 0xaf:
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: bad KBC command AF\n");
+#endif
+		return 1;
+
+	case 0xcf:	/*??? - sent by MegaPC BIOS*/
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: ??? - sent by MegaPC BIOS\n");
+#endif
+		dev->want60 = 1;
+		return 0;
+    }
+
+    return write64_generic(dev, val);
+}
+
+
+static uint8_t
+write60_toshiba(void *priv, uint8_t val)
+{
+    atkbd_t *dev = (atkbd_t *)priv;
+
+    switch(dev->command) {
+	case 0xb6:	/* T3100e - set color/mono switch */
+		t3100e_mono_set(val);
+		return 0;
+    }
+
+    return 1;
+}
+
+
+static uint8_t
+write64_toshiba(void *priv, uint8_t val)
+{
+    atkbd_t *dev = (atkbd_t *)priv;
+
+    switch (val) {
+	case 0xaf:
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: bad KBC command AF\n");
+#endif
+		return 1;
+
+	case 0xb0:	/* T3100e: Turbo on */
+		t3100e_turbo_set(1);
+		return 0;
+
+	case 0xb1:	/* T3100e: Turbo off */
+		t3100e_turbo_set(0);
+		return 0;
+
+	case 0xb2:	/* T3100e: Select external display */
+		t3100e_display_set(0x00);
+		return 0;
+
+	case 0xb3:	/* T3100e: Select internal display */
+		t3100e_display_set(0x01);
+		return 0;
+
+	case 0xb4:	/* T3100e: Get configuration / status */
+		add_data(dev, t3100e_config_get());
+		return 0;
+
+	case 0xb5:	/* T3100e: Get colour / mono byte */
+		add_data(dev, t3100e_mono_get());
+		return 0;
+
+	case 0xb6:	/* T3100e: Set colour / mono byte */
+		dev->want60 = 1;
+		return 0;
+
+	case 0xb7:	/* T3100e: Emulate PS/2 keyboard - not implemented */
+	case 0xb8:	/* T3100e: Emulate AT keyboard - not implemented */
+		return 0;
+
+	case 0xbb:	/* T3100e: Read 'Fn' key.
+			   Return it for right Ctrl and right Alt; on the real
+			   T3100e, these keystrokes could only be generated
+			   using 'Fn'. */
+		if (keyboard_recv(0xb8) ||	/* Right Alt */
+		    keyboard_recv(0x9d))	/* Right Ctrl */
+			add_data(dev, 0x04);
+		else	add_data(dev, 0x00);
+		return 0;
+
+	case 0xbc:	/* T3100e: Reset Fn+Key notification */
+		t3100e_notify_set(0x00);
+		return 0;
+
+	case 0xc0:	/*Read input port*/
+#ifdef ENABLE_KEYBOARD_AT_LOG
+		kbd_log("ATkbd: read input port\n");
+#endif
+
+		/* The T3100e returns all bits set except bit 6 which
+		 * is set by t3100e_mono_set() */
+		dev->input_port = (t3100e_mono_get() & 1) ? 0xff : 0xbf;
+		add_data(dev, dev->input_port);
+		return 0;
+
+    }
+
+    return write64_generic(dev, val);
+}
+
+
+static void
+kbd_write(uint16_t port, uint8_t val, void *priv)
+{
+    atkbd_t *dev = (atkbd_t *)priv;
+    int i = 0;
+    int bad = 1;
+    uint8_t mask;
+
+    if (((dev->flags & KBC_VEN_MASK) == KBC_VEN_XI8088) && (port == 0x63))
+	port = 0x61;
+
+#ifdef ENABLE_KEYBOARD_AT_LOG
+    kbd_log("ATkbd: write(%04X, %02X)\n", port, val);
+#endif
+
+    switch (port) {
+	case 0x60:
+		if (dev->want60) {
+			/* Write data to controller. */
+			dev->want60 = 0;
+
+			switch (dev->command) {
+				case 0x60: case 0x61: case 0x62: case 0x63:
+				case 0x64: case 0x65: case 0x66: case 0x67:
+				case 0x68: case 0x69: case 0x6a: case 0x6b:
+				case 0x6c: case 0x6d: case 0x6e: case 0x6f:
+				case 0x70: case 0x71: case 0x72: case 0x73:
+				case 0x74: case 0x75: case 0x76: case 0x77:
+				case 0x78: case 0x79: case 0x7a: case 0x7b:
+				case 0x7c: case 0x7d: case 0x7e: case 0x7f:
+					dev->mem[dev->command & 0x1f] = val;
+					if (dev->command == 0x60)
+						write_cmd(dev, val);
+					break;
+
+				case 0xd1: /* write output port */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+					kbd_log("ATkbd: write output port\n");
+#endif
+					if (dev->output_locked) {
+						/*If keyboard controller lines P22-P23 are blocked,
+						  we force them to remain unchanged.*/
+						val &= ~0x0c;
+						val |= (dev->output_port & 0x0c);
 					}
-					else
-					{
-						if (val <= 3)
-						{
-							mode &= 0xFC;
-							mode |= (val & 3);
+					write_output(dev, val);
+					break;
+
+				case 0xd2: /* write to keyboard output buffer */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+					kbd_log("ATkbd: write to keyboard output buffer\n");
+#endif
+					add_data_kbd(val);
+					break;
+
+				case 0xd3: /* write to mouse output buffer */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+					kbd_log("ATkbd: write to mouse output buffer\n");
+#endif
+					if (mouse_write && ((dev->flags & KBC_TYPE_MASK) >= KBC_TYPE_PS2_NOREF))
+						keyboard_at_adddata_mouse(val);
+					break;
+
+				case 0xd4: /* write to mouse */
+					kbd_log("ATkbd: write to mouse (%02X)\n", val);
+
+					if (val == 0xbb)
+						break;
+
+					set_enable_mouse(dev, 1);
+					if (mouse_write && ((dev->flags & KBC_TYPE_MASK) >= KBC_TYPE_PS2_NOREF))
+						mouse_write(val, mouse_p);
+					else if (!mouse_write && ((dev->flags & KBC_TYPE_MASK) >= KBC_TYPE_PS2_NOREF) &&
+						 ((dev->flags & KBC_VEN_MASK) == KBC_VEN_AMI))
+						keyboard_at_adddata_mouse(0xff);
+					break;
+
+				default:
+					/*
+					 * Run the vendor-specific handler
+					 * if we have one. Otherwise, or if
+					 * it returns an error, log a bad
+					 * controller command.
+					 */
+					if (dev->write60_ven)
+						bad = dev->write60_ven(dev, val);
+
+					if (bad) {
+						kbd_log("ATkbd: bad controller command %02x data %02x\n", dev->command, val);
+						add_data_kbd(0xfe);
+					}
+			}
+		} else {
+			/* Write data to keyboard. */
+			dev->mem[0] &= ~0x10;
+
+			if (dev->key_wantdata) {
+				dev->key_wantdata = 0;
+
+				/*
+				 * Several system BIOSes and OS device drivers
+				 * mess up with this, and repeat the command
+				 * code many times.  Fun!
+				 */
+				if (val == dev->key_command) {
+#if 1
+					/* Respond NAK and ignore it. */
+					add_data_kbd(0xfe);
+					dev->key_command = 0x00;
+					break;
+#else
+					goto do_command;
+#endif
+				}
+
+				switch (dev->key_command) {
+					case 0xed: /* set/reset LEDs */
+						add_data_kbd(0xfa);
+						kbd_log("ATkbd: set LEDs [%02x]\n", val);
+						break;
+
+					case 0xf0: /* get/set scancode set */
+						add_data_kbd(0xfa);
+						if (val == 0) {
+							kbd_log("Get scan code set: %02X\n", keyboard_mode & 3);
+							add_data_kbd(keyboard_mode & 3);
+						} else {
+							if ((val <= 3) && (val != 1)) {
+								keyboard_mode &= 0xfc;
+								keyboard_mode |= (val & 3);
+								kbd_log("Scan code set now: %02X\n", val);
+							}
+							set_scancode_map(dev);
 						}
-						keyboard_at_adddata_keyboard(0xfa);
-					}
-					break;
+						break;
 
-                                        case 0xf3: /*Set typematic rate/delay*/
-                                        keyboard_at_adddata_keyboard(0xfa);
-                                        break;
-                                        
-                                        default:
-                                        pclog("Bad AT keyboard 0060 write %02X command %02X\n", val, keyboard_at.key_command);
-                                }
-                        }
-                        else
-                        {
-                                keyboard_at.key_command = val;
-                                switch (val)
-                                {
+					case 0xf3: /* set typematic rate/delay */
+						add_data_kbd(0xfa);
+						break;
+					
+					default:
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: bad keyboard 0060 write %02X command %02X\n", val, dev->key_command);
+#endif
+						add_data_kbd(0xfe);
+						break;
+				}
+
+				/* Keyboard command is now done. */
+				dev->key_command = 0x00;
+			} else {
+#if 0
+do_command:
+#endif
+				/* No keyboard command in progress. */
+				dev->key_command = 0x00;
+
+				set_enable_kbd(dev, 1);
+
+				switch (val) {
 					case 0x00:
-					keyboard_at_adddata_keyboard(0xfa);
-					break;
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: command 00\n");
+#endif
+						add_data_kbd(0xfa);
+						break;
 
-                                        case 0x05: /*??? - sent by NT 4.0*/
-                                        keyboard_at_adddata_keyboard(0xfe);
-                                        break;
+					case 0x05: /*??? - sent by NT 4.0*/
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: command 05 (NT 4.0)\n");
+#endif
+						add_data_kbd(0xfe);
+						break;
 
-					case 0x71: /*These two commands are sent by Pentium-era AMI BIOS'es.*/
+					/* Sent by Pentium-era AMI BIOS'es.*/
+					case 0x71:
 					case 0x82:
-					break;
+						kbd_log("ATkbd: Pentium-era AMI BIOS command %02X\n", val);
+						break;
 
-                                        case 0xed: /*Set/reset LEDs*/
-                                        keyboard_at.key_wantdata = 1;
-                                        keyboard_at_adddata_keyboard(0xfa);
-                                        break;
+					case 0xed: /* set/reset LEDs */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: set/reset leds\n");
+#endif
+						add_data_kbd(0xfa);
 
-					case 0xee: /*Diagnostic echo*/
-                                        keyboard_at_adddata_keyboard(0xee);
-					break;
+						dev->key_wantdata = 1;
+						break;
 
-					case 0xef: /*NOP (No OPeration). Reserved for future use.*/
-					break;
-                                        
-					case 0xf0: /*Get/set scan code set*/
-					keyboard_at.key_wantdata = 1;
-					keyboard_at_adddata_keyboard(0xfa);
-					break;
-                                        
-                                        case 0xf2: /*Read ID*/
-					/* Fixed as translation will be done in keyboard_at_adddata_keyboard(). */
-                                        keyboard_at_adddata_keyboard(0xfa);
-                                        keyboard_at_adddata_keyboard(0xab);
-                                        keyboard_at_adddata_keyboard(0x83);
-                                        break;
-                                        
-                                        case 0xf3: /*Set typematic rate/delay*/
-                                        keyboard_at.key_wantdata = 1;
-                                        keyboard_at_adddata_keyboard(0xfa);
-                                        break;
-                                        
-                                        case 0xf4: /*Enable keyboard*/
-                                        keyboard_scan = 1;
-                                        keyboard_at_adddata_keyboard(0xfa);
-                                        break;
-                                        case 0xf5: /*Disable keyboard*/
-                                        keyboard_scan = 0;
-                                        keyboard_at_adddata_keyboard(0xfa);
-                                        break;
-                                        
-                                        case 0xf6: /*Set defaults*/
-					set3_all_break = 0;
-					set3_all_repeat = 0;
-					memset(set3_flags, 0, 272);
-					mode = (mode & 0xFC) | keyboard_at.default_mode;
-                                        keyboard_at_adddata_keyboard(0xfa);
-                                        break;
-                                        
-                                        case 0xf7: /*Set all keys to repeat*/
-					set3_all_break = 1;
-                                        keyboard_at_adddata_keyboard(0xfa);
-                                        break;
-                                        
-                                        case 0xf8: /*Set all keys to give make/break codes*/
-					set3_all_break = 1;
-                                        keyboard_at_adddata_keyboard(0xfa);
-                                        break;
-                                        
-                                        case 0xf9: /*Set all keys to give make codes only*/
-					set3_all_break = 0;
-                                        keyboard_at_adddata_keyboard(0xfa);
-                                        break;
-                                        
-                                        case 0xfa: /*Set all keys to repeat and give make/break codes*/
-                                        set3_all_repeat = 1;
-					set3_all_break = 1;
-                                        keyboard_at_adddata_keyboard(0xfa);
-                                        break;
-                                        
-                                        case 0xfe: /*Resend last scan code*/
-                                        keyboard_at_adddata_keyboard(keyboard_at.last_scan_code);
-					break;
-                                        
-                                        case 0xff: /*Reset*/
-                                        key_queue_start = key_queue_end = 0; /*Clear key queue*/
-                                        keyboard_at_adddata_keyboard(0xfa);
-                                        keyboard_at_adddata_keyboard(0xaa);
-					/* Set system flag to 1 and scan code set to 2. */
-					mode &= 0xFC;
-					mode |= 2;
-                                        break;
-                                        
-                                        default:
-                                        pclog("Bad AT keyboard command %02X\n", val);
-                                        keyboard_at_adddata_keyboard(0xfe);
-                                }
-                        }
-                }
-                break;
-               
-                case 0x61:
-                ppi.pb = val;
+					case 0xee: /* diagnostic echo */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: ECHO\n");
+#endif
+						add_data_kbd(0xee);
+						break;
 
-                timer_process();
-                timer_update_outstanding();
+					case 0xef: /* NOP (reserved for future use) */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: NOP\n");
+#endif
+						break;
+
+					case 0xf0: /* get/set scan code set */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: scan code set\n");
+#endif
+						add_data_kbd(0xfa);
+						dev->key_wantdata = 1;
+						break;
+
+					case 0xf2: /* read ID */
+						/* Fixed as translation will be done in add_data_kbd(). */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: read keyboard id\n");
+#endif
+						add_data_kbd(0xfa);
+						add_data_kbd(0xab);
+						add_data_kbd(0x83);
+						break;
+
+					case 0xf3: /* set typematic rate/delay */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: set typematic rate/delay\n");
+#endif
+						add_data_kbd(0xfa);
+						dev->key_wantdata = 1;
+						break;
+
+					case 0xf4: /* enable keyboard */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: enable keyboard via keyboard\n");
+#endif
+						add_data_kbd(0xfa);
+						keyboard_scan = 1;
+						break;
+
+					case 0xf5: /* disable keyboard */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: disable keyboard via keyboard\n");
+#endif
+						keyboard_scan = 0;
+
+						/*
+						 * Disabling the keyboard also
+						 * resets it to the default
+						 * values.
+						 */
+						/*FALLTHROUGH*/
+
+					case 0xf6: /* set defaults */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: set defaults\n");
+#endif
+						add_data_kbd(0xfa);
+
+						keyboard_set3_all_break = 0;
+						keyboard_set3_all_repeat = 0;
+						memset(keyboard_set3_flags, 0, 512);
+						keyboard_mode = (keyboard_mode & 0xfc) | 0x02;
+						set_scancode_map(dev);
+						break;
+
+					case 0xf7: /* set all keys to repeat */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: set all keys to repeat\n");
+#endif
+						add_data_kbd(0xfa);
+						keyboard_set3_all_break = 1;
+						break;
+
+					case 0xf8: /* set all keys to give make/break codes */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: set all keys to give make/break codes\n");
+#endif
+						add_data_kbd(0xfa);
+						keyboard_set3_all_break = 1;
+						break;
+
+					case 0xf9: /* set all keys to give make codes only */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: set all keys to give make codes only\n");
+#endif
+						add_data_kbd(0xfa);
+						keyboard_set3_all_break = 0;
+						break;
+
+					case 0xfa: /* set all keys to repeat and give make/break codes */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: set all keys to repeat and give make/break codes\n");
+#endif
+						add_data_kbd(0xfa);
+						keyboard_set3_all_repeat = 1;
+						keyboard_set3_all_break = 1;
+						break;
+
+					case 0xfe: /* resend last scan code */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: reset last scan code\n");
+#endif
+						add_data_kbd(key_queue[key_queue_end]);
+						break;
+
+					case 0xff: /* reset */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+						kbd_log("ATkbd: kbd reset\n");
+#endif
+						key_queue_start = key_queue_end = 0; /*Clear key queue*/
+						add_data_kbd(0xfa);
+						add_data_kbd(0xaa);
+
+						/* Set scan code set to 2. */
+						keyboard_mode = (keyboard_mode & 0xfc) | 0x02;
+						set_scancode_map(dev);
+						break;
+
+					default:
+						kbd_log("ATkbd: bad keyboard command %02X\n", val);
+						add_data_kbd(0xfe);
+				}
+
+				/* If command needs data, remember command. */
+				if (dev->key_wantdata == 1)
+					dev->key_command = val;
+			}
+		}
+		break;
+
+	case 0x61:
+		ppi.pb = val;
 
 		speaker_update();
-                speaker_gated = val & 1;
-                speaker_enable = val & 2;
-                if (speaker_enable) 
-                        was_speaker_enable = 1;
-                pit_set_gate(&pit, 2, val & 1);
-                break;
-                
-                case 0x64:
-                keyboard_at.want60 = 0;
-                keyboard_at.command = val;
-                /*New controller command*/
-                switch (val)
-                {
-                        case 0x00: case 0x01: case 0x02: case 0x03:
-                        case 0x04: case 0x05: case 0x06: case 0x07:
-                        case 0x08: case 0x09: case 0x0a: case 0x0b:
-                        case 0x0c: case 0x0d: case 0x0e: case 0x0f:
-                        case 0x10: case 0x11: case 0x12: case 0x13:
-                        case 0x14: case 0x15: case 0x16: case 0x17:
-                        case 0x18: case 0x19: case 0x1a: case 0x1b:
-                        case 0x1c: case 0x1d: case 0x1e: case 0x1f:
-			val |= 0x20;				/* 0x00-0x1f are aliases for 0x20-0x3f */
-                        keyboard_at_adddata(keyboard_at.mem[val & 0x1f]);
-                        break;
+		speaker_gated = val & 1;
+		speaker_enable = val & 2;
+		if (speaker_enable) 
+			was_speaker_enable = 1;
+		pit_ctr_set_gate(&pit->counters[2], val & 1);
 
-                        case 0x20: case 0x21: case 0x22: case 0x23:
-                        case 0x24: case 0x25: case 0x26: case 0x27:
-                        case 0x28: case 0x29: case 0x2a: case 0x2b:
-                        case 0x2c: case 0x2d: case 0x2e: case 0x2f:
-                        case 0x30: case 0x31: case 0x32: case 0x33:
-                        case 0x34: case 0x35: case 0x36: case 0x37:
-                        case 0x38: case 0x39: case 0x3a: case 0x3b:
-                        case 0x3c: case 0x3d: case 0x3e: case 0x3f:
-                        keyboard_at_adddata(keyboard_at.mem[val & 0x1f]);
-                        break;
+                if ((dev->flags & KBC_VEN_MASK) == KBC_VEN_XI8088)
+#ifdef USE_NEW_STUFF
+			dev->write_func(dev->func_priv, !!(val & 0x04));
+#else
+			xi8088_turbo_set(!!(val & 0x04));
+#endif
+		break;
 
-                        case 0x60: case 0x61: case 0x62: case 0x63:
-                        case 0x64: case 0x65: case 0x66: case 0x67:
-                        case 0x68: case 0x69: case 0x6a: case 0x6b:
-                        case 0x6c: case 0x6d: case 0x6e: case 0x6f:
-                        case 0x70: case 0x71: case 0x72: case 0x73:
-                        case 0x74: case 0x75: case 0x76: case 0x77:
-                        case 0x78: case 0x79: case 0x7a: case 0x7b:
-                        case 0x7c: case 0x7d: case 0x7e: case 0x7f:
-                        keyboard_at.want60 = 1;
-                        break;
-                        
-                        case 0xa1: /*AMI - get controlled version*/
-                        break;
-                                
-                        case 0xa7: /*Disable mouse port*/
-                        mouse_scan = 0;
-                        break;
+	case 0x64:
+		/* Controller command. */
+		dev->want60 = 0;
 
-                        case 0xa8: /*Enable mouse port*/
-                        mouse_scan = 1;
-                        break;
-                        
-                        case 0xa9: /*Test mouse port*/
-                        keyboard_at_adddata(0x00); /*no error*/
-                        break;
-                        
-                        case 0xaa: /*Self-test*/
-                        if (!keyboard_at.initialised)
-                        {
-                                keyboard_at.initialised = 1;
-                                key_ctrl_queue_start = key_ctrl_queue_end = 0;
-                                keyboard_at.status &= ~STAT_OFULL;
-                        }
-                        keyboard_at.status |= STAT_SYSFLAG;
-                        keyboard_at.mem[0] |= 0x04;
-                        keyboard_at_adddata(0x55);
-                        /*Self-test also resets the output port, enabling A20*/
-                        if (!(keyboard_at.output_port & 0x02))
-                        {
-                                mem_a20_key = 2;
-                                mem_a20_recalc();
-                                flushmmucache();
-                        }
-                        keyboard_at.output_port = 0xcf;
-                        break;
-                        
-                        case 0xab: /*Interface test*/
-                        keyboard_at_adddata(0x00); /*no error*/
-                        break;
-                        
-                        case 0xac: /*Diagnostic dump*/
-			for (i = 0; i < 16; i++)
-			{
-	                        keyboard_at_adddata(keyboard_at.mem[i]);
-			}
-                        keyboard_at_adddata((keyboard_at.input_port & 0xf0) | 0x80);
-                        keyboard_at_adddata(keyboard_at.output_port);
-                        keyboard_at_adddata(keyboard_at.status);
-                        break;
-                        
-                        case 0xad: /*Disable keyboard*/
-                        keyboard_at.mem[0] |=  0x10;
-                        break;
+		switch (val) {
+			/* Read data from KBC memory. */
+			case 0x20: case 0x21: case 0x22: case 0x23:
+			case 0x24: case 0x25: case 0x26: case 0x27:
+			case 0x28: case 0x29: case 0x2a: case 0x2b:
+			case 0x2c: case 0x2d: case 0x2e: case 0x2f:
+			case 0x30: case 0x31: case 0x32: case 0x33:
+			case 0x34: case 0x35: case 0x36: case 0x37:
+			case 0x38: case 0x39: case 0x3a: case 0x3b:
+			case 0x3c: case 0x3d: case 0x3e: case 0x3f:
+				add_data(dev, dev->mem[val & 0x1f]);
+				break;
 
-                        case 0xae: /*Enable keyboard*/
-                        keyboard_at.mem[0] &= ~0x10;
-                        break;
-                        
-                        case 0xaf:
-			switch(romset)
-			{
-				case ROM_AMI286:
-				case ROM_AMI386SX:
-				case ROM_AMI386DX_OPTI495:
-				case ROM_MR386DX_OPTI495:
-				case ROM_AMI486:
-				case ROM_WIN486:
-				case ROM_REVENGE:
-				case ROM_PLATO:
-				case ROM_ENDEAVOR:
-				case ROM_THOR:
-				case ROM_MRTHOR:
-				case ROM_AP53:
-				case ROM_P55T2S:
-				case ROM_S1668:
-					/*Set extended controlled RAM*/
-		                        keyboard_at.want60 = 1;
-					keyboard_at.secr_phase = 1;
-					break;
-				default:
-					/*Read keyboard version*/
-		                        keyboard_at_adddata(0x00);
-					break;
-			}
-			break;
+			/* Write data to KBC memory. */
+			case 0x60: case 0x61: case 0x62: case 0x63:
+			case 0x64: case 0x65: case 0x66: case 0x67:
+			case 0x68: case 0x69: case 0x6a: case 0x6b:
+			case 0x6c: case 0x6d: case 0x6e: case 0x6f:
+			case 0x70: case 0x71: case 0x72: case 0x73:
+			case 0x74: case 0x75: case 0x76: case 0x77:
+			case 0x78: case 0x79: case 0x7a: case 0x7b:
+			case 0x7c: case 0x7d: case 0x7e: case 0x7f:
+				dev->want60 = 1;
+				break;
 
-			case 0xb0: case 0xb1: case 0xb2: case 0xb3: case 0xb4: case 0xb5: case 0xb6: case 0xb7:
-			case 0xb8: case 0xb9: case 0xba: case 0xbb: case 0xbc: case 0xbd: case 0xbe: case 0xbf:
-			/*Set keyboard lines low (B0-B7) or high (B8-BF)*/
-			keyboard_at_adddata(0x00);
-			break;
+			case 0xaa:	/* self-test */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+				kbd_log("ATkbd: self-test\n");
+#endif
+				if ((dev->flags & KBC_VEN_MASK) == KBC_VEN_TOSHIBA)
+					dev->status |= STAT_IFULL;
+				if (! dev->initialized) {
+					dev->initialized = 1;
+					key_ctrl_queue_start = key_ctrl_queue_end = 0;
+					dev->status &= ~STAT_OFULL;
+				}
+				dev->status |= STAT_SYSFLAG;
+				dev->mem[0] |= 0x04;
+				keyboard_mode |= 0x04;
+				set_enable_kbd(dev, 1);
+				if ((dev->flags & KBC_TYPE_MASK) >= KBC_TYPE_PS2_NOREF)
+					set_enable_mouse(dev, 1);
+				write_output(dev, 0xcf);
+				add_data(dev, 0x55);
+				break;
 
-                        case 0xc0: /*Read input port*/
-                        keyboard_at_adddata(keyboard_at.input_port | 4 | fdc_ps1_525());
-                        keyboard_at.input_port = ((keyboard_at.input_port + 1) & 3) | (keyboard_at.input_port & 0xfc) | fdc_ps1_525();
-                        break;
+			case 0xab:	/* interface test */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+				kbd_log("ATkbd: interface test\n");
+#endif
+				add_data(dev, 0x00); /*no error*/
+				break;
 
-			case 0xc1: /*Copy bits 0 to 3 of input port to status bits 4 to 7*/
-			keyboard_at.status &= 0xf;
-			keyboard_at.status |= ((((keyboard_at.input_port & 0xfc) | 0x84 | fdc_ps1_525()) & 0xf) << 4);
-			break;
-                        
-			case 0xc2: /*Copy bits 4 to 7 of input port to status bits 4 to 7*/
-			keyboard_at.status &= 0xf;
-			keyboard_at.status |= (((keyboard_at.input_port & 0xfc) | 0x84 | fdc_ps1_525()) & 0xf0);
-			break;
-                        
-                        case 0xc9: /*AMI - block P22 and P23 ??? */
-                        break;
-                        
-                        case 0xca: /*AMI - read keyboard mode*/
-                        keyboard_at_adddata(0x00); /*ISA mode*/
-                        break;
-                        
-                        case 0xcb: /*AMI - set keyboard mode*/
-                        keyboard_at.want60 = 1;
-                        break;
-                        
-                        case 0xcf: /*??? - sent by MegaPC BIOS*/
-                        keyboard_at.want60 = 1;
-                        break;
-                        
-                        case 0xd0: /*Read output port*/
-                        keyboard_at_adddata(keyboard_at.output_port);
-                        break;
-                        
-                        case 0xd1: /*Write output port*/
-                        keyboard_at.want60 = 1;
-                        break;
+			case 0xac:	/* diagnostic dump */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+				kbd_log("ATkbd: diagnostic dump\n");
+#endif
+				for (i = 0; i < 16; i++)
+					add_data(dev, dev->mem[i]);
+				add_data(dev, (dev->input_port & 0xf0) | 0x80);
+				add_data(dev, dev->output_port);
+				add_data(dev, dev->status);
+				break;
 
-                        case 0xd2: /*Write keyboard output buffer*/
-                        keyboard_at.want60 = 1;
-                        break;
-                        
-                        case 0xd3: /*Write mouse output buffer*/
-                        keyboard_at.want60 = 1;
-                        break;
-                        
-                        case 0xd4: /*Write to mouse*/
-                        keyboard_at.want60 = 1;
-                        break;
+			case 0xad:	/* disable keyboard */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+				kbd_log("ATkbd: disable keyboard\n");
+#endif
+				set_enable_kbd(dev, 0);
+				break;
 
-			case 0xdd: /* Disable A20 Address Line */
-			keyboard_at.output_port &= ~0x02;
-			mem_a20_key = 0;
-			mem_a20_recalc();
-			flushmmucache();
-			break;
+			case 0xae:	/* enable keyboard */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+				kbd_log("ATkbd: enable keyboard\n");
+#endif
+				set_enable_kbd(dev, 1);
+				break;
 
-			case 0xdf: /* Enable A20 Address Line */
-			keyboard_at.output_port |= 0x02;
-			mem_a20_key = 2;
-			mem_a20_recalc();
-			flushmmucache();
-			break;
+			case 0xd0:	/* read output port */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+				kbd_log("ATkbd: read output port\n");
+#endif
+				mask = 0xff;
+				if (!keyboard_scan)
+					mask &= 0xbf;
+				if (!mouse_scan && ((dev->flags & KBC_TYPE_MASK) >= KBC_TYPE_PS2_NOREF))
+					mask &= 0xf7;
+				add_data(dev, dev->output_port & mask);
+				break;
 
-                        case 0xe0: /*Read test inputs*/
-                        keyboard_at_adddata(0x00);
-                        break;
-                        
-                        case 0xef: /*??? - sent by AMI486*/
-                        break;
+			case 0xd1:	/* write output port */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+				kbd_log("ATkbd: write output port\n");
+#endif
+				dev->want60 = 1;
+				break;
 
-			case 0xf0: case 0xf1: case 0xf2: case 0xf3: case 0xf4: case 0xf5: case 0xf6: case 0xf7:
-			case 0xf8: case 0xf9: case 0xfa: case 0xfb: case 0xfc: case 0xfd: case 0xfe: case 0xff:
-			if (!(val & 1))
-			{
-				/* Pin 0 selected. */
-				/* trc_reset(2); */
-        	                softresetx86(); /*Pulse reset!*/
-	                        cpu_set_edx();
-			}
-			break;
-                                
-                        default:
-                        pclog("Bad AT keyboard controller command %02X\n", val);
-                }
-        }
+			case 0xd2:	/* write keyboard output buffer */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+				kbd_log("ATkbd: write keyboard output buffer\n");
+#endif
+				dev->want60 = 1;
+				break;
+
+#if 0
+			case 0xd4:	/* dunno, but OS/2 2.00LA sends it */
+				dev->want60 = 1;
+				break;
+#endif
+
+			case 0xdd:	/* disable A20 address line */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+				kbd_log("ATkbd: disable A20\n");
+#endif
+				write_output(dev, dev->output_port & 0xfd);
+				break;
+
+			case 0xdf:	/* enable A20 address line */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+				kbd_log("ATkbd: enable A20\n");
+#endif
+				write_output(dev, dev->output_port | 0x02);
+				break;
+
+			case 0xe0:	/* read test inputs */
+#ifdef ENABLE_KEYBOARD_AT_LOG
+				kbd_log("ATkbd: read test inputs\n");
+#endif
+				add_data(dev, 0x00);
+				break;
+
+			default:
+				/*
+				 * Unrecognized controller command.
+				 *
+				 * If we have a vendor-specific handler, run
+				 * that. Otherwise, or if that handler fails,
+				 * log a bad command.
+				 */
+				if (dev->write64_ven)
+					bad = dev->write64_ven(dev, val);
+
+#ifdef ENABLE_KEYBOARD_AT_LOG
+				if (bad)
+					kbd_log("ATkbd: bad controller command %02X\n", val);
+#endif
+		}
+
+		/* If the command needs data, remember the command. */
+		if (dev->want60)
+			dev->command = val;
+		break;
+    }
 }
 
-uint8_t keyboard_at_read(uint16_t port, void *priv)
-{
-        uint8_t temp = 0xff;
-        switch (port)
-        {
-                case 0x60:
-                temp = keyboard_at.out;
-                keyboard_at.status &= ~(STAT_OFULL/* | STAT_MFULL*/);
-		if (PCI)
-		{
-			/* The PIIX/PIIX3 datasheet mandates that both of these interrupts are cleared on any read of port 0x60. */
-	                picintc(1 << 1);
-	                picintc(1 << 12);
-		}
-		else
-		{
-	                picintc(keyboard_at.last_irq);
-		}
-                keyboard_at.last_irq = 0;
-                break;
 
-                case 0x61:
-                temp = ppi.pb & ~0xe0;
-                if (ppispeakon)
-                        temp |= 0x20;
-                if (keyboard_at.is_ps2)
-                {
-                        if (keyboard_at.refresh)
-                                temp |= 0x10;
+static uint8_t
+kbd_read(uint16_t port, void *priv)
+{
+    atkbd_t *dev = (atkbd_t *)priv;
+    uint8_t ret = 0xff;
+
+    if (((dev->flags & KBC_VEN_MASK) == KBC_VEN_XI8088) && (port == 0x63))
+	port = 0x61;
+
+    switch (port) {
+	case 0x60:
+		ret = dev->out;
+		dev->status &= ~(STAT_OFULL);
+		if (dev->last_irq) {
+			picintc(dev->last_irq);
+			dev->last_irq = 0;
+		}
+		break;
+
+	case 0x61:
+		ret = ppi.pb & ~0xe0;
+		if (ppispeakon)
+			ret |= 0x20;
+		if ((dev->flags & KBC_TYPE_MASK) > KBC_TYPE_PS2_NOREF) {
+			if (dev->refresh)
+				ret |= 0x10;
+			else
+				ret &= ~0x10;
+		}
+                if ((dev->flags & KBC_VEN_MASK) == KBC_VEN_XI8088) {
+#ifdef USE_NEW_STUFF
+			if (dev->read_func(dev->func_priv))
+#else
+			if (xi8088_turbo_get())
+#endif
+                                ret |= 0x04;
                         else
-                                temp &= ~0x10;
+                                ret &= ~0x04;
                 }
-                break;
-                
-                case 0x64:
-                temp = (keyboard_at.status & 0xFB) | (mode & CCB_SYSTEM);
-		/* if (mode & CCB_IGNORELOCK) */  temp |= STAT_LOCK;
-                keyboard_at.status &= ~(STAT_RTIMEOUT/* | STAT_TTIMEOUT*/);
-                break;
-        }
-        return temp;
+		break;
+
+	case 0x64:
+		// ret = (dev->status & 0xFB) | (keyboard_mode & CCB_SYSTEM);
+		// ret |= STAT_UNLOCKED;
+		ret = (dev->status & 0xFB);
+		if (dev->mem[0] & STAT_SYSFLAG)
+			ret |= STAT_SYSFLAG;
+		/* The transmit timeout (TTIMEOUT) flag should *NOT* be cleared, otherwise
+		   the IBM PS/2 Model 80's BIOS gives error 8601 (mouse error). */
+		dev->status &= ~(STAT_RTIMEOUT/* | STAT_TTIMEOUT*/);
+		break;
+
+	default:
+		kbd_log("ATkbd: read(%04x) invalid!\n", port);
+		break;
+    }
+
+#ifdef ENABLE_KEYBOARD_AT_LOG
+    if (port != 0x61)
+	kbd_log("ATkbd: read(%04X) = %02X\n", port, ret);
+#endif
+
+    return(ret);
 }
 
-void keyboard_at_reset(void)
+
+static void
+kbd_refresh(void *priv)
 {
-        keyboard_at.initialised = 0;
-        keyboard_at.status = STAT_LOCK | STAT_CD;
-        keyboard_at.mem[0] = 0x11;
-	mode = 0x02 | dtrans;
-	keyboard_at.default_mode = 2;
-	first_write = 1;
-        keyboard_at.wantirq = 0;
-        keyboard_at.output_port = 0xcf;
-        keyboard_at.input_port = (MDA) ? 0xf0 : 0xb0;
-        keyboard_at.out_new = -1;
-        keyboard_at.last_irq = 0;
-	keyboard_at.secr_phase = 0;
-        
-        keyboard_at.key_wantdata = 0;
-        
-        keyboard_scan = 1;
+    atkbd_t *dev = (atkbd_t *)priv;
 
-	sc_or = 0;
-
-	memset(set3_flags, 0, 272);
+    dev->refresh = !dev->refresh;
+    timer_advance_u64(&dev->refresh_time, PS2_REFRESH_TIME);
 }
 
-static void at_refresh(void *p)
+
+static void
+kbd_reset(void *priv)
 {
-        keyboard_at.refresh = !keyboard_at.refresh;
-        keyboard_at.refresh_time += PS2_REFRESH_TIME;
+    atkbd_t *dev = (atkbd_t *)priv;
+
+    dev->initialized = 0;
+    dev->first_write = 1;
+    dev->status = STAT_UNLOCKED | STAT_CD;
+    dev->mem[0] = 0x01;
+    if ((dev->flags & KBC_VEN_MASK) == KBC_VEN_XI8088)
+	dev->mem[0] |= CCB_TRANSLATE;
+    dev->wantirq = 0;
+    write_output(dev, 0xcf);
+    dev->out_new = -1;
+    dev->last_irq = 0;
+    dev->secr_phase = 0;
+    dev->key_wantdata = 0;
+
+    /* Set up the correct Video Type bits. */
+    if ((dev->flags & KBC_VEN_MASK) == KBC_VEN_XI8088)
+	dev->input_port = video_is_mda() ? 0xb0 : 0xf0;
+    else
+	dev->input_port = video_is_mda() ? 0xf0 : 0xb0;
+    kbd_log("ATkbd: input port = %02x\n", dev->input_port);
+
+    keyboard_mode = 0x02 | (dev->mem[0] & CCB_TRANSLATE);
+
+    /* Enable keyboard, disable mouse. */
+    set_enable_kbd(dev, 1);
+    set_enable_mouse(dev, 0);
+
+    sc_or = 0;
+
+    memset(keyboard_set3_flags, 0, 512);
+
+    set_scancode_map(dev);
 }
 
-void keyboard_at_init(void)
+
+/* Reset the AT keyboard - this is needed for the PCI TRC and is done
+   until a better solution is found. */
+void
+keyboard_at_reset(void)
 {
-        io_sethandler(0x0060, 0x0005, keyboard_at_read, NULL, NULL, keyboard_at_write, NULL, NULL,  NULL);
-        keyboard_at_reset();
-        keyboard_send = keyboard_at_adddata_keyboard;
-        keyboard_poll = keyboard_at_poll;
-        keyboard_at.mouse_write = NULL;
-        keyboard_at.mouse_p = NULL;
-        keyboard_at.is_ps2 = 0;
-	dtrans = 0;
-        
-        timer_add((void (*)(void *))keyboard_at_poll, &keybsenddelay, TIMER_ALWAYS_ENABLED,  NULL);
+    kbd_reset(SavedKbd);
 }
 
-void keyboard_at_set_mouse(void (*mouse_write)(uint8_t val, void *p), void *p)
+
+static void
+kbd_close(void *priv)
 {
-        keyboard_at.mouse_write = mouse_write;
-        keyboard_at.mouse_p = p;
+    atkbd_t *dev = (atkbd_t *)priv;
+
+    kbd_reset(dev);
+
+    /* Stop timers. */
+    timer_disable(&dev->send_delay_timer);
+    timer_disable(&dev->refresh_time);
+
+    keyboard_scan = 0;
+    keyboard_send = NULL;
+
+    /* Disable the scancode maps. */
+    keyboard_set_table(NULL);
+
+    SavedKbd = NULL;
+    free(dev);
 }
 
-void keyboard_at_init_ps2(void)
+
+static void *
+kbd_init(const device_t *info)
 {
-        timer_add(at_refresh, &keyboard_at.refresh_time, TIMER_ALWAYS_ENABLED,  NULL);
-        keyboard_at.is_ps2 = 1;
+    atkbd_t *dev;
+
+    dev = (atkbd_t *)malloc(sizeof(atkbd_t));
+    memset(dev, 0x00, sizeof(atkbd_t));
+
+    dev->flags = info->local;
+
+    video_reset(gfxcard);
+    kbd_reset(dev);
+
+    io_sethandler(0x0060, 5,
+		  kbd_read, NULL, NULL, kbd_write, NULL, NULL, dev);
+    keyboard_send = add_data_kbd;
+
+    timer_add(&dev->send_delay_timer, kbd_poll, dev, 1); 
+
+    if ((dev->flags & KBC_TYPE_MASK) > KBC_TYPE_PS2_NOREF)
+	timer_add(&dev->refresh_time, kbd_refresh, dev, 1);
+
+    timer_add(&dev->pulse_cb, pulse_poll, dev, 0);
+
+    dev->write60_ven = NULL;
+    dev->write64_ven = NULL;
+
+    switch(dev->flags & KBC_VEN_MASK) {
+	case KBC_VEN_GENERIC:
+	case KBC_VEN_IBM_PS1:
+	case KBC_VEN_XI8088:
+		dev->write64_ven = write64_generic;
+		break;
+
+	case KBC_VEN_AMI:
+		dev->write60_ven = write60_ami;
+		dev->write64_ven = write64_ami;
+		break;
+
+	case KBC_VEN_IBM_MCA:
+		dev->write64_ven = write64_ibm_mca;
+		break;
+
+	case KBC_VEN_QUADTEL:
+		dev->write60_ven = write60_quadtel;
+		dev->write64_ven = write64_quadtel;
+		break;
+
+	case KBC_VEN_TOSHIBA:
+		dev->write60_ven = write60_toshiba;
+		dev->write64_ven = write64_toshiba;
+		break;
+
+	case KBC_VEN_ACER:
+		dev->write60_ven = write60_acer;
+		dev->write64_ven = write64_acer;
+		break;
+    }
+
+    /* We need this, sadly. */
+    SavedKbd = dev;
+
+    return(dev);
+}
+
+
+const device_t keyboard_at_device = {
+    "PC/AT Keyboard",
+    0,
+    KBC_TYPE_ISA | KBC_VEN_GENERIC,
+    kbd_init,
+    kbd_close,
+    kbd_reset,
+    NULL, NULL, NULL, NULL
+};
+
+const device_t keyboard_at_ami_device = {
+    "PC/AT Keyboard (AMI)",
+    0,
+    KBC_TYPE_ISA | KBC_VEN_AMI,
+    kbd_init,
+    kbd_close,
+    kbd_reset,
+    NULL, NULL, NULL, NULL
+};
+
+const device_t keyboard_at_toshiba_device = {
+    "PC/AT Keyboard (Toshiba)",
+    0,
+    KBC_TYPE_ISA | KBC_VEN_TOSHIBA,
+    kbd_init,
+    kbd_close,
+    kbd_reset,
+    NULL, NULL, NULL, NULL
+};
+
+const device_t keyboard_ps2_device = {
+    "PS/2 Keyboard",
+    0,
+    KBC_TYPE_PS2_NOREF | KBC_VEN_GENERIC,
+    kbd_init,
+    kbd_close,
+    kbd_reset,
+    NULL, NULL, NULL, NULL
+};
+
+const device_t keyboard_ps2_ps2_device = {
+    "PS/2 Keyboard",
+    0,
+    KBC_TYPE_PS2_1 | KBC_VEN_GENERIC,
+    kbd_init,
+    kbd_close,
+    kbd_reset,
+    NULL, NULL, NULL, NULL
+};
+
+const device_t keyboard_ps2_ps1_device = {
+    "PS/2 Keyboard (IBM PS/1)",
+    0,
+    KBC_TYPE_PS2_NOREF | KBC_VEN_IBM_PS1,
+    kbd_init,
+    kbd_close,
+    kbd_reset,
+    NULL, NULL, NULL, NULL
+};
+
+const device_t keyboard_ps2_xi8088_device = {
+    "PS/2 Keyboard (Xi8088)",
+    0,
+    KBC_TYPE_PS2_1 | KBC_VEN_XI8088,
+    kbd_init,
+    kbd_close,
+    kbd_reset,
+    NULL, NULL, NULL, NULL
+};
+
+const device_t keyboard_ps2_ami_device = {
+    "PS/2 Keyboard (AMI)",
+    0,
+    KBC_TYPE_PS2_NOREF | KBC_VEN_AMI,
+    kbd_init,
+    kbd_close,
+    kbd_reset,
+    NULL, NULL, NULL, NULL
+};
+
+const device_t keyboard_ps2_mca_device = {
+    "PS/2 Keyboard",
+    0,
+    KBC_TYPE_PS2_1 | KBC_VEN_IBM_MCA,
+    kbd_init,
+    kbd_close,
+    kbd_reset,
+    NULL, NULL, NULL, NULL
+};
+
+const device_t keyboard_ps2_mca_2_device = {
+    "PS/2 Keyboard",
+    0,
+    KBC_TYPE_PS2_2 | KBC_VEN_IBM_MCA,
+    kbd_init,
+    kbd_close,
+    kbd_reset,
+    NULL, NULL, NULL, NULL
+};
+
+const device_t keyboard_ps2_quadtel_device = {
+    "PS/2 Keyboard (Quadtel/MegaPC)",
+    0,
+    KBC_TYPE_PS2_NOREF | KBC_VEN_QUADTEL,
+    kbd_init,
+    kbd_close,
+    kbd_reset,
+    NULL, NULL, NULL, NULL
+};
+
+const device_t keyboard_ps2_pci_device = {
+    "PS/2 Keyboard",
+    DEVICE_PCI,
+    KBC_TYPE_PS2_NOREF | KBC_VEN_GENERIC,
+    kbd_init,
+    kbd_close,
+    kbd_reset,
+    NULL, NULL, NULL
+};
+
+const device_t keyboard_ps2_ami_pci_device = {
+    "PS/2 Keyboard (AMI)",
+    DEVICE_PCI,
+    KBC_TYPE_PS2_NOREF | KBC_VEN_AMI,
+    kbd_init,
+    kbd_close,
+    kbd_reset,
+    NULL, NULL, NULL
+};
+
+const device_t keyboard_ps2_acer_device = {
+    "PS/2 Keyboard (Acer 90M002A)",
+    DEVICE_PCI,
+#ifdef KBC_VEN_ACER
+    KBC_TYPE_PS2_NOREF | KBC_VEN_ACER,
+#else
+    KBC_TYPE_PS2_NOREF | KBC_VEN_GENERIC,
+#endif
+    kbd_init,
+    kbd_close,
+    kbd_reset,
+    NULL, NULL, NULL
+};
+
+
+void
+keyboard_at_set_mouse(void (*func)(uint8_t val, void *priv), void *priv)
+{
+    mouse_write = func;
+    mouse_p = priv;
+}
+
+
+void
+keyboard_at_adddata_keyboard_raw(uint8_t val)
+{
+    key_queue[key_queue_end] = val;
+    key_queue_end = (key_queue_end + 1) & 0xf;
+}
+
+
+void
+keyboard_at_adddata_mouse(uint8_t val)
+{
+    mouse_queue[mouse_queue_end] = val;
+    mouse_queue_end = (mouse_queue_end + 1) & 0xf;
+}
+
+
+#ifdef USE_NEW_STUFF
+/* Set custom machine-dependent keyboard stuff. */
+void
+keyboard_at_set_funcs(void *arg, uint8_t (*readfunc)(void *), void (*writefunc)(void *, uint8_t), void *priv)
+{
+    atkbd_t *dev = (atkbd_t *)arg;
+
+    dev->read_func = readfunc;
+    dev->write_func = writefunc;
+    dev->func_priv = priv;
+}
+#endif
+
+
+void
+keyboard_at_set_mouse_scan(uint8_t val)
+{
+    atkbd_t *dev = SavedKbd;
+    uint8_t temp_mouse_scan = val ? 1 : 0;
+
+    if (temp_mouse_scan == mouse_scan) return;
+
+    set_enable_mouse(dev, val ? 1 : 0);
+
+#ifdef ENABLE_KEYBOARD_AT_LOG
+    kbd_log("ATkbd: mouse scan %sabled via PCI\n", mouse_scan ? "en" : "dis");
+#endif
+}
+
+
+uint8_t
+keyboard_at_get_mouse_scan(void)
+{
+    return(mouse_scan ? 0x10 : 0x00);
 }

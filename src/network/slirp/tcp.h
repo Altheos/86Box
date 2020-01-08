@@ -33,7 +33,11 @@
 #ifndef _TCP_H_
 #define _TCP_H_
 
+#if defined(__amd64__) || defined(__aarch64__)
+typedef	uintptr_t	tcp_seq;
+#else
 typedef	u_int32_t	tcp_seq;
+#endif
 
 #define      PR_SLOWHZ       2               /* 2 slow timeouts per second (approx) */
 #define      PR_FASTHZ       5               /* 5 fast timeouts per second (not important) */

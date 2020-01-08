@@ -1,7 +1,10 @@
 /* Copyright holders: Sarah Walker
    see COPYING for more details
 */
-#include "ibm.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <wchar.h>
 #include "io.h"
 #include "nmi.h"
 

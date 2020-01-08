@@ -7,6 +7,9 @@
 
 #define WANT_SYS_IOCTL_H
 #include <stdlib.h>
+#ifndef _WIN32
+# include <unistd.h>
+#endif
 #include "slirp.h"
 
 u_int curtime, time_fasttimo, last_slowtimo, detach_time;
@@ -126,8 +129,8 @@ getouraddr()
 //what?!
 
 struct quehead_32 {
-	u_int32_t qh_link;
-	u_int32_t qh_rlink;
+	uintptr_t qh_link;
+	uintptr_t qh_rlink;
 };
 
 inline void
@@ -138,10 +141,10 @@ insque_32(a, b)
 	register struct quehead_32 *element = (struct quehead_32 *) a;
 	register struct quehead_32 *head = (struct quehead_32 *) b;
 	element->qh_link = head->qh_link;
-	head->qh_link = (u_int32_t)element;
-	element->qh_rlink = (u_int32_t)head;
+	head->qh_link = (uintptr_t)element;
+	element->qh_rlink = (uintptr_t)head;
 	((struct quehead_32 *)(element->qh_link))->qh_rlink
-	= (u_int32_t)element;
+	= (uintptr_t)element;
 }
 
 inline void
@@ -220,12 +223,6 @@ add_exec(ex_ptr, do_pty, exec, addr, port)
 /*
  * For systems with no strerror
  */
-
-#ifdef WIN32
-//extern int sys_nerr;
-//extern char *sys_errlist[];
-#endif
-
 char *
 SLIRPstrerror(error)
 	int error;

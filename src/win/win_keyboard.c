@@ -8,204 +8,216 @@
  *
  *		Windows raw keyboard input handler.
  *
- * Version:	@(#)win_d3d.cc	1.0.0	2017/05/30
+ * Version:	@(#)win_keyboard.c	1.0.10	2018/04/29
  *
  * Author:	Miran Grca, <mgrca8@gmail.com>
- *		Copyright 2016-2017 Miran Grca.
+ *
+ *		Copyright 2016-2018 Miran Grca.
  */
-
 #define UNICODE
 #define  _WIN32_WINNT 0x0501
 #define BITMAP WINDOWS_BITMAP
 #include <windows.h>
 #include <windowsx.h>
 #undef BITMAP
-
-#include <commctrl.h>
-#include <commdlg.h>
-#include <process.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdarg.h>
-#include <stdlib.h>
 #include <stdint.h>
-
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "../86box.h"
 #include "../device.h"
-#include "plat_keyboard.h"
-
+#include "../keyboard.h"
+#include "../plat.h"
 #include "win.h"
 
-#ifndef MAPVK_VK_TO_VSC
-#define MAPVK_VK_TO_VSC 0
-#endif
 
-static uint16_t	scancode_map[65536];
+static uint16_t	scancode_map[768];
+
 
 /* This is so we can disambiguate scan codes that would otherwise conflict and get
    passed on incorrectly. */
-UINT16 convert_scan_code(UINT16 scan_code)
+static UINT16
+convert_scan_code(UINT16 scan_code)
 {
-	switch (scan_code)
-        {
-		case 0xE001:
-		return 0xF001;
-		case 0xE002:
-		return 0xF002;
-		case 0xE0AA:
-		return 0xF003;
-		case 0xE005:
-		return 0xF005;
-		case 0xE006:
-		return 0xF006;
-		case 0xE007:
-		return 0xF007;
-		case 0xE071:
-		return 0xF008;
-		case 0xE072:
-		return 0xF009;
-		case 0xE07F:
-		return 0xF00A;
-		case 0xE0E1:
-		return 0xF00B;
-		case 0xE0EE:
-		return 0xF00C;
-		case 0xE0F1:
-		return 0xF00D;
-		case 0xE0FE:
-		return 0xF00E;
-		case 0xE0EF:
-		return 0xF00F;
+    if ((scan_code & 0xff00) == 0xe000)
+	scan_code = (scan_code & 0xff) | 0x0100;
 
-		default:
-		return scan_code;
-	}
+    if (scan_code == 0xE11D)
+	scan_code = 0x0100;
+    /* E0 00 is sent by some USB keyboards for their special keys, as it is an
+       invalid scan code (it has no untranslated set 2 equivalent), we mark it
+       appropriately so it does not get passed through. */
+    else if ((scan_code > 0x01FF) || (scan_code == 0x0100))
+	scan_code = 0xFFFF;
+
+    return scan_code;
 }
 
-void get_registry_key_map()
+
+void
+keyboard_getkeymap(void)
 {
-	WCHAR *keyName = L"SYSTEM\\CurrentControlSet\\Control\\Keyboard Layout";
-	WCHAR *valueName = L"Scancode Map";
-	unsigned char buf[32768];
-	DWORD bufSize;
-	HKEY hKey;
-	int j;
-	UINT32 *bufEx2;
-	int scMapCount;
-	UINT16 *bufEx;
-	int scancode_unmapped;
-	int scancode_mapped;
+    WCHAR *keyName = L"SYSTEM\\CurrentControlSet\\Control\\Keyboard Layout";
+    WCHAR *valueName = L"Scancode Map";
+    unsigned char buf[32768];
+    DWORD bufSize;
+    HKEY hKey;
+    int j;
+    UINT32 *bufEx2;
+    int scMapCount;
+    UINT16 *bufEx;
+    int scancode_unmapped;
+    int scancode_mapped;
 
- 	/* First, prepare the default scan code map list which is 1:1.
- 	   Remappings will be inserted directly into it.
- 	   65536 bytes so scan codes fit in easily and it's easy to find what each maps too,
- 	   since each array element is a scan code and provides for E0, etc. ones too. */
-	for (j = 0; j < 65536; j++)
-		scancode_map[j] = convert_scan_code(j);
+    /* First, prepare the default scan code map list which is 1:1.
+     * Remappings will be inserted directly into it.
+     * 512 bytes so this takes less memory, bit 9 set means E0
+     * prefix.
+     */
+    for (j = 0; j < 512; j++)
+	scancode_map[j] = j;
 
-	bufSize = 32768;
- 	/* Get the scan code remappings from:
- 	   HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Keyboard Layout */
-	if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, keyName, 0, 1, &hKey) == ERROR_SUCCESS)
-        {
-		if(RegQueryValueEx(hKey, valueName, NULL, NULL, buf, &bufSize) == ERROR_SUCCESS)
-                {
-			bufEx2 = (UINT32 *) buf;
-			scMapCount = bufEx2[2];
-			if ((bufSize != 0) && (scMapCount != 0))
-                        {
-				bufEx = (UINT16 *) (buf + 12);
-				for (j = 0; j < scMapCount*2; j += 2)
- 				{
- 					/* Each scan code is 32-bit: 16 bits of remapped scan code,
- 					   and 16 bits of original scan code. */
-  					scancode_unmapped = bufEx[j + 1];
-  					scancode_mapped = bufEx[j];
+    /* Get the scan code remappings from:
+    HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Keyboard Layout */
+    bufSize = 32768;
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, keyName, 0, 1, &hKey) == ERROR_SUCCESS) {
+	if (RegQueryValueEx(hKey, valueName, NULL, NULL, buf, &bufSize) == ERROR_SUCCESS) {
+		bufEx2 = (UINT32 *) buf;
+		scMapCount = bufEx2[2];
+		if ((bufSize != 0) && (scMapCount != 0)) {
+			bufEx = (UINT16 *) (buf + 12);
+			for (j = 0; j < scMapCount*2; j += 2) {
+ 				/* Each scan code is 32-bit: 16 bits of remapped scan code,
+ 				   and 16 bits of original scan code. */
+  				scancode_unmapped = bufEx[j + 1];
+  				scancode_mapped = bufEx[j];
 
-  					scancode_mapped = convert_scan_code(scancode_mapped);
+				scancode_unmapped = convert_scan_code(scancode_unmapped);
+				scancode_mapped = convert_scan_code(scancode_mapped);
 
-					/* Fixes scan code map logging. */
-  					scancode_map[scancode_unmapped] = scancode_mapped;
-  				}
+				/* Ignore source scan codes with prefixes other than E1
+				   that are not E1 1D. */
+				if (scancode_unmapped != 0xFFFF)
+					scancode_map[scancode_unmapped] = scancode_mapped;
 			}
 		}
-		RegCloseKey(hKey);
 	}
+	RegCloseKey(hKey);
+    }
 }
 
-void process_raw_input(LPARAM lParam, int infocus)
+
+void
+keyboard_handle(LPARAM lParam, int infocus)
 {
-	uint32_t ri_size = 0;
-	UINT size;
-	RAWINPUT *raw;
-	USHORT scancode;
+    uint32_t ri_size = 0;
+    UINT size;
+    RAWINPUT *raw;
+    USHORT scancode;
+    static int recv_lalt = 0, recv_ralt = 0, recv_tab = 0;
 
-	if (!infocus)
-	{
-		return;
-	}
+    if (! infocus) return;
 
-	GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL, &size, sizeof(RAWINPUTHEADER));
+    GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL,
+		    &size, sizeof(RAWINPUTHEADER));
 
-	raw = malloc(size);
+    raw = malloc(size);
+    if (raw == NULL) return;
 
-	if (raw == NULL)
-	{
-		return;
-	}
+    /* Here we read the raw input data for the keyboard */
+    ri_size = GetRawInputData((HRAWINPUT)(lParam), RID_INPUT,
+			      raw, &size, sizeof(RAWINPUTHEADER));
+    if (ri_size != size) return;
 
-	/* Here we read the raw input data for the keyboard */
-	ri_size = GetRawInputData((HRAWINPUT)(lParam), RID_INPUT, raw, &size, sizeof(RAWINPUTHEADER));
+    /* If the input is keyboard, we process it */
+    if (raw->header.dwType == RIM_TYPEKEYBOARD) {
+	RAWKEYBOARD rawKB = raw->data.keyboard;
+	scancode = rawKB.MakeCode;
 
-	if(ri_size != size)
-	{
-		return;
-	}
+	/* If it's not a scan code that starts with 0xE1 */
+	if (!(rawKB.Flags & RI_KEY_E1)) {
+		if (rawKB.Flags & RI_KEY_E0)
+			scancode |= 0x100;
 
-	/* If the input is keyboard, we process it */
-	if (raw->header.dwType == RIM_TYPEKEYBOARD)
-	{
-		RAWKEYBOARD rawKB = raw->data.keyboard;
-		scancode = rawKB.MakeCode;
+		/* Translate the scan code to 9-bit */
+		scancode = convert_scan_code(scancode);
 
-		/* If it's not a scan code that starts with 0xE1 */
-		if (!(rawKB.Flags & RI_KEY_E1))
-		{
-			if (rawKB.Flags & RI_KEY_E0)
-			{
-				scancode |= (0xE0 << 8);
+		/* Remap it according to the list from the Registry */
+		if (scancode != scancode_map[scancode])
+			pclog("Scan code remap: %03X -> %03X\n", scancode, scancode);
+		scancode = scancode_map[scancode];
+
+		/* If it's not 0xFFFF, send it to the emulated
+		   keyboard.
+		   We use scan code 0xFFFF to mean a mapping that
+		   has a prefix other than E0 and that is not E1 1D,
+		   which is, for our purposes, invalid. */
+		if ((scancode == 0x00F) &&
+		    !(rawKB.Flags & RI_KEY_BREAK) &&
+		    (recv_lalt || recv_ralt) &&
+		    !mouse_capture) {
+			/* We received a TAB while ALT was pressed, while the mouse
+			   is not captured, suppress the TAB and send an ALT key up. */
+			if (recv_lalt) {
+				keyboard_input(0, 0x038);
+				/* Extra key press and release so the guest is not stuck in the
+				   menu bar. */
+				keyboard_input(1, 0x038);
+				keyboard_input(0, 0x038);
+				recv_lalt = 0;
+			}
+			if (recv_ralt) {
+				keyboard_input(0, 0x138);
+				/* Extra key press and release so the guest is not stuck in the
+				   menu bar. */
+				keyboard_input(1, 0x138);
+				keyboard_input(0, 0x138);
+				recv_ralt = 0;
+			}
+		} else if (((scancode == 0x038) || (scancode == 0x138)) &&
+			   !(rawKB.Flags & RI_KEY_BREAK) &&
+			   recv_tab &&
+			   !mouse_capture) {
+			/* We received an ALT while TAB was pressed, while the mouse
+			   is not captured, suppress the ALT and send a TAB key up. */
+			keyboard_input(0, 0x00F);
+			recv_tab = 0;
+		} else {
+			switch(scancode) {
+				case 0x00F:
+					recv_tab = !(rawKB.Flags & RI_KEY_BREAK);
+					break;
+				case 0x038:
+					recv_lalt = !(rawKB.Flags & RI_KEY_BREAK);
+					break;
+				case 0x138:
+					recv_ralt = !(rawKB.Flags & RI_KEY_BREAK);
+					break;
 			}
 
-			/* Remap it according to the list from the Registry */
-			scancode = scancode_map[scancode];
+			/* Translate right CTRL to left ALT if the user has so
+			   chosen. */
+			if ((scancode == 0x11D) && rctrl_is_lalt)
+				scancode = 0x038;
 
-			if ((scancode >> 8) == 0xF0)
-			{
-				scancode |= 0x100; /* Extended key code in disambiguated format */
-			}
-			else if ((scancode >> 8) == 0xE0)
-			{
-				scancode |= 0x80; /* Normal extended key code */
-			}
-
-			/* If it's not 0 (therefore not 0xE1, 0xE2, etc),
-			   then pass it on to the rawinputkey array */
-			if (!(scancode & 0xf00))
-			{
-				recv_key[scancode & 0x1ff] = !(rawKB.Flags & RI_KEY_BREAK);
-			}
+			/* Normal scan code pass through, pass it through as is if
+			   it's not an invalid scan code. */
+			if (scancode != 0xFFFF)
+				keyboard_input(!(rawKB.Flags & RI_KEY_BREAK), scancode);
 		}
-		else
-		{
-			if (rawKB.MakeCode == 0x1D)
-			{
-				scancode = 0xFF;
-			}
-			if (!(scancode & 0xf00))
-			{
-				recv_key[scancode & 0x1ff] = !(rawKB.Flags & RI_KEY_BREAK);
-			}
-		}
+	} else {
+		if (rawKB.MakeCode == 0x1D) {
+			scancode = scancode_map[0x100];	/* Translate E1 1D to 0x100 (which would
+							   otherwise be E0 00 but that is invalid
+							   anyway).
+							   Also, take a potential mapping into
+							   account. */
+		} else
+			scancode = 0xFFFF;
+		if (scancode != 0xFFFF)
+			keyboard_input(!(rawKB.Flags & RI_KEY_BREAK), scancode);
 	}
+    }
 
-	free(raw);
+    free(raw);
 }

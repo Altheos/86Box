@@ -1,8 +1,13 @@
+#include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include "../ibm.h"
+#include <stdlib.h>
+#include <wchar.h>
+#define HAVE_STDARG_H
+#include "../86box.h"
 #include "../io.h"
+#include "../nmi.h"
 #include "../pic.h"
 #include "../dma.h"
 #include "../timer.h"
@@ -42,13 +47,14 @@ typedef struct gus_t
         int16_t buffer[2][SOUNDBUFLEN];
         int pos;
         
-        int samp_timer, samp_latch;
+        pc_timer_t samp_timer; 
+	uint64_t samp_latch;
         
         uint8_t *ram;
         
         int irqnext;
         
-        int timer_1, timer_2;
+        pc_timer_t timer_1, timer_2;
         
         int irq, dma, irq_midi;
         int latch_enable;
@@ -327,9 +333,9 @@ gus->curx[gus->voice]=(gus->curx[gus->voice]&0xFFF8000)|((val&0x7F)<<8);
                         if (gus->voices<14) gus->voices=14;
                         gus->global=val;
                         if (gus->voices < 14)
-                                gus->samp_latch = (int)(TIMER_USEC * (1000000.0 / 44100.0));
+                                gus->samp_latch = (uint64_t)(TIMER_USEC * (1000000.0 / 44100.0));
                         else
-                                gus->samp_latch = (int)(TIMER_USEC * (1000000.0 / gusfreqs[gus->voices - 14]));
+                                gus->samp_latch = (uint64_t)(TIMER_USEC * (1000000.0 / gusfreqs[gus->voices - 14]));
                         break;
 
                         case 0x41: /*DMA*/
@@ -740,7 +746,7 @@ void gus_poll_timer_1(void *p)
 {
         gus_t *gus = (gus_t *)p;
         
-	gus->timer_1 += (TIMER_USEC * 80);
+	timer_advance_u64(&gus->timer_1, (uint64_t)(TIMER_USEC * 80));
         if (gus->t1on)
         {
                 gus->t1++;
@@ -771,7 +777,7 @@ void gus_poll_timer_2(void *p)
 {
         gus_t *gus = (gus_t *)p;
         
-	gus->timer_2 += (TIMER_USEC * 320);
+	timer_advance_u64(&gus->timer_2, (uint64_t)(TIMER_USEC * 320));
         if (gus->t2on)
         {
                 gus->t2++;
@@ -827,7 +833,7 @@ void gus_poll_wave(void *p)
         
         gus_update(gus);
         
-        gus->samp_timer += gus->samp_latch;
+	timer_advance_u64(&gus->samp_timer, gus->samp_latch);
         
         gus->out_l = gus->out_r = 0;
 
@@ -993,7 +999,7 @@ static void gus_get_buffer(int32_t *buffer, int len, void *p)
 }
 
 
-void *gus_init()
+void *gus_init(const device_t *info)
 {
         int c;
 	double out = 1.0;
@@ -1002,8 +1008,6 @@ void *gus_init()
 
         gus->ram = malloc(1 << 20);
         memset(gus->ram, 0, 1 << 20);
-        
-        pclog("gus_init\n");
         
         for (c=0;c<32;c++)
         {
@@ -1017,10 +1021,9 @@ void *gus_init()
 		out/=1.002709201;		/* 0.0235 dB Steps */
 	}
 
-	printf("Top volume %f %f %f %f\n",vol16bit[4095],vol16bit[3800],vol16bit[3000],vol16bit[2048]);
 	gus->voices=14;
 
-        gus->samp_timer = gus->samp_latch = (int)(TIMER_USEC * (1000000.0 / 44100.0));
+	gus->samp_latch = (uint64_t)(TIMER_USEC * (1000000.0 / 44100.0));
 
         gus->t1l = gus->t2l = 0xff;
                 
@@ -1028,9 +1031,9 @@ void *gus_init()
         io_sethandler(0x0340, 0x0010, readgus, NULL, NULL, writegus, NULL, NULL,  gus);
         io_sethandler(0x0746, 0x0001, readgus, NULL, NULL, writegus, NULL, NULL,  gus);        
         io_sethandler(0x0388, 0x0002, readgus, NULL, NULL, writegus, NULL, NULL,  gus);
-        timer_add(gus_poll_wave, &gus->samp_timer, TIMER_ALWAYS_ENABLED,  gus);
-        timer_add(gus_poll_timer_1, &gus->timer_1, TIMER_ALWAYS_ENABLED,  gus);
-        timer_add(gus_poll_timer_2, &gus->timer_2, TIMER_ALWAYS_ENABLED,  gus);
+		timer_add(&gus->samp_timer, gus_poll_wave, gus, 1);
+		timer_add(&gus->timer_1, gus_poll_timer_1, gus, 1);
+		timer_add(&gus->timer_2, gus_poll_timer_2, gus, 1);
 
         sound_add_handler(gus_get_buffer, gus);
         
@@ -1050,19 +1053,16 @@ void gus_speed_changed(void *p)
         gus_t *gus = (gus_t *)p;
 
         if (gus->voices < 14)
-                gus->samp_latch = (int)(TIMER_USEC * (1000000.0 / 44100.0));
+                gus->samp_latch = (uint64_t)(TIMER_USEC * (1000000.0 / 44100.0));
         else
-                gus->samp_latch = (int)(TIMER_USEC * (1000000.0 / gusfreqs[gus->voices - 14]));
+                gus->samp_latch = (uint64_t)(TIMER_USEC * (1000000.0 / gusfreqs[gus->voices - 14]));
 }
 
-device_t gus_device =
+const device_t gus_device =
 {
         "Gravis UltraSound",
-        0,
-        gus_init,
-        gus_close,
-        NULL,
-        gus_speed_changed,
-        NULL,
+        0, 0,
+        gus_init, gus_close, NULL, NULL,
+        gus_speed_changed, NULL,
         NULL
 };

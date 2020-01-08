@@ -10,20 +10,23 @@
  *
  *		Based on old original code @(#)dir_win32.c 1.2.0 2007/04/19
  *
- * Version:	@(#)win_opendir.c	1.0.1	2017/05/17
+ * Version:	@(#)win_opendir.c	1.0.4	2017/11/18
  *
  * Author:	Fred N. van Kempen, <decwiz@yahoo.com>
+ *
  *		Copyright 1998-2007 MicroWalt Corporation
  *		Copyright 2017 Fred N. van Kempen
  */
 #define UNICODE
 #include <windows.h>
 #include <io.h>
-#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
-#include "../ibm.h"
+#include <stdlib.h>
+#include <wchar.h>
+#include "../86box.h"
+#include "../plat.h"
 #include "plat_dir.h"
 
 

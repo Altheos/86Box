@@ -1,23 +1,31 @@
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <wchar.h>
 #include <math.h>
 #ifndef INFINITY
 # define INFINITY   (__builtin_inff())
 #endif
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include "../ibm.h"
+#define HAVE_STDARG_H
+#include "../86box.h"
 #include "cpu.h"
 #include "x86.h"
 #include "x86_ops.h"
 #include "x87.h"
+#include "../io.h"
 #include "../mem.h"
-#include "codegen.h"
-#include "../disc.h"
-#include "../fdc.h"
+#include "../nmi.h"
 #include "../pic.h"
 #include "../timer.h"
-
+#include "../floppy/fdd.h"
+#include "../floppy/fdc.h"
+#ifdef USE_DYNAREC
+#include "codegen.h"
+#endif
 #include "386_common.h"
+
 
 #define CPU_BLOCK_END() cpu_block_end = 1
 
@@ -26,54 +34,35 @@ uint32_t cpu_cur_status = 0;
 int cpu_reps, cpu_reps_latched;
 int cpu_notreps, cpu_notreps_latched;
 
-int inrecomp = 0;
+int inrecomp = 0, cpu_block_end = 0;
 int cpu_recomp_blocks, cpu_recomp_full_ins, cpu_new_blocks;
 int cpu_recomp_blocks_latched, cpu_recomp_ins_latched, cpu_recomp_full_ins_latched, cpu_new_blocks_latched;
 
-int cpu_block_end = 0;
 
-int nmi_enable = 1;
-
-int inscounts[256];
-uint32_t oldpc2;
-
-int trap;
+#ifdef ENABLE_386_DYNAREC_LOG
+int x386_dynarec_do_log = ENABLE_386_DYNAREC_LOG;
 
 
+void
+x386_dynarec_log(const char *fmt, ...)
+{
+    va_list ap;
 
-int cpl_override=0;
+    if (x386_dynarec_do_log) {
+	va_start(ap, fmt);
+	pclog_ex(fmt, ap);
+	va_end(ap);
+    }
+}
+#else
+#define x86_dynarec_log (fmt, ...)
+#endif
 
-int has_fpu;
-int fpucount=0;
-uint16_t rds;
-uint16_t ea_rseg;
-
-int is486;
-int cgate32;
-
-
-uint8_t romext[32768];
-uint8_t *ram,*rom;
-
-uint32_t rmdat32;
-uint32_t backupregs[16];
-int oddeven=0;
-int inttype;
-
-
-uint32_t oldcs2;
-uint32_t oldecx;
-
-uint32_t *eal_r, *eal_w;
-
-uint16_t *mod1add[2][8];
-uint32_t *mod1seg[8];
 
 static __inline void fetch_ea_32_long(uint32_t rmdat)
 {
         eal_r = eal_w = NULL;
         easeg = cpu_state.ea_seg->base;
-        ea_rseg = cpu_state.ea_seg->seg;
         if (cpu_rm == 4)
         {
                 uint8_t sib = rmdat >> 8;
@@ -99,8 +88,7 @@ static __inline void fetch_ea_32_long(uint32_t rmdat)
                 else if ((sib & 6) == 4 && !cpu_state.ssegs)
                 {
                         easeg = ss;
-                        ea_rseg = SS;
-                        cpu_state.ea_seg = &_ss;
+                        cpu_state.ea_seg = &cpu_state.seg_ss;
                 }
                 if (((sib >> 3) & 7) != 4) 
                         cpu_state.eaaddr += cpu_state.regs[(sib >> 3) & 7].l << (sib >> 6);
@@ -113,8 +101,7 @@ static __inline void fetch_ea_32_long(uint32_t rmdat)
                         if (cpu_rm == 5 && !cpu_state.ssegs)
                         {
                                 easeg = ss;
-                                ea_rseg = SS;
-                                cpu_state.ea_seg = &_ss;
+                                cpu_state.ea_seg = &cpu_state.seg_ss;
                         }
                         if (cpu_mod == 1) 
                         { 
@@ -146,7 +133,6 @@ static __inline void fetch_ea_16_long(uint32_t rmdat)
 {
         eal_r = eal_w = NULL;
         easeg = cpu_state.ea_seg->base;
-        ea_rseg = cpu_state.ea_seg->seg;
         if (!cpu_mod && cpu_rm == 6) 
         { 
                 cpu_state.eaaddr = getword();
@@ -169,8 +155,7 @@ static __inline void fetch_ea_16_long(uint32_t rmdat)
                 if (mod1seg[cpu_rm] == &ss && !cpu_state.ssegs)
                 {
                         easeg = ss;
-                        ea_rseg = SS;
-                        cpu_state.ea_seg = &_ss;
+                        cpu_state.ea_seg = &cpu_state.seg_ss;
                 }
                 cpu_state.eaaddr &= 0xFFFF;
         }
@@ -201,27 +186,45 @@ void x86_int(int num)
         }
         else
         {
-                if (stack32)
+                addr = (num << 2) + idt.base;
+
+                if ((num << 2) + 3 > idt.limit)
                 {
-                        writememw(ss,ESP-2,flags);
-                        writememw(ss,ESP-4,CS);
-                        writememw(ss,ESP-6,cpu_state.pc);
-                        ESP-=6;
+                        if (idt.limit < 35)
+                        {
+                                cpu_state.abrt = 0;
+                                softresetx86();
+                                cpu_set_edx();
+#ifdef ENABLE_386_DYNAREC_LOG
+                                x386_dynarec_log("Triple fault in real mode - reset\n");
+#endif
+                        }
+                        else
+                                x86_int(8);
                 }
                 else
                 {
-                        writememw(ss,((SP-2)&0xFFFF),flags);
-                        writememw(ss,((SP-4)&0xFFFF),CS);
-                        writememw(ss,((SP-6)&0xFFFF),cpu_state.pc);
-                        SP-=6;
-                }
-                addr = (num << 2) + idt.base;
+                        if (stack32)
+                        {
+                                writememw(ss,ESP-2,cpu_state.flags);
+                                writememw(ss,ESP-4,CS);
+                                writememw(ss,ESP-6,cpu_state.pc);
+                                ESP-=6;
+                        }
+                        else
+                        {
+                                writememw(ss,((SP-2)&0xFFFF),cpu_state.flags);
+                                writememw(ss,((SP-4)&0xFFFF),CS);
+                                writememw(ss,((SP-6)&0xFFFF),cpu_state.pc);
+                                SP-=6;
+                        }
 
-                flags&=~I_FLAG;
-                flags&=~T_FLAG;
-                oxpc=cpu_state.pc;
-                cpu_state.pc=readmemw(0,addr);
-                loadcs(readmemw(0,addr+2));
+                        cpu_state.flags&=~I_FLAG;
+                        cpu_state.flags&=~T_FLAG;
+						oxpc=cpu_state.pc;
+                        cpu_state.pc=readmemw(0,addr);
+                        loadcs(readmemw(0,addr+2));
+                }
         }
         cycles-=70;
         CPU_BLOCK_END();
@@ -238,28 +241,36 @@ void x86_int_sw(int num)
         }
         else
         {
-                if (stack32)
+                addr = (num << 2) + idt.base;
+
+                if ((num << 2) + 3 > idt.limit)
                 {
-                        writememw(ss,ESP-2,flags);
-                        writememw(ss,ESP-4,CS);
-                        writememw(ss,ESP-6,cpu_state.pc);
-                        ESP-=6;
+                        x86_int(13);
                 }
                 else
                 {
-                        writememw(ss,((SP-2)&0xFFFF),flags);
-                        writememw(ss,((SP-4)&0xFFFF),CS);
-                        writememw(ss,((SP-6)&0xFFFF),cpu_state.pc);
-                        SP-=6;
-                }
-                addr = (num << 2) + idt.base;
+                        if (stack32)
+                        {
+                                writememw(ss,ESP-2,cpu_state.flags);
+                                writememw(ss,ESP-4,CS);
+                                writememw(ss,ESP-6,cpu_state.pc);
+                                ESP-=6;
+                        }
+                        else
+                        {
+                                writememw(ss,((SP-2)&0xFFFF),cpu_state.flags);
+                                writememw(ss,((SP-4)&0xFFFF),CS);
+                                writememw(ss,((SP-6)&0xFFFF),cpu_state.pc);
+                                SP-=6;
+                        }
 
-                flags&=~I_FLAG;
-                flags&=~T_FLAG;
-                oxpc=cpu_state.pc;
-                cpu_state.pc=readmemw(0,addr);
-                loadcs(readmemw(0,addr+2));
-                cycles -= timing_int_rm;
+                        cpu_state.flags&=~I_FLAG;
+                        cpu_state.flags&=~T_FLAG;
+						oxpc=cpu_state.pc;
+                        cpu_state.pc=readmemw(0,addr);
+                        loadcs(readmemw(0,addr+2));
+                        cycles -= timing_int_rm;
+                }
         }
         trap = 0;
         CPU_BLOCK_END();
@@ -279,16 +290,28 @@ int x86_int_sw_rm(int num)
 
         if (cpu_state.abrt) return 1;
 
-        writememw(ss,((SP-2)&0xFFFF),flags); if (cpu_state.abrt) {pclog("abrt5\n"); return 1; }
+        writememw(ss,((SP-2)&0xFFFF),cpu_state.flags);
+	if (cpu_state.abrt) {
+#ifdef ENABLE_386_DYNAREC_LOG
+		x386_dynarec_log("abrt5\n");
+#endif
+		return 1;
+	}
         writememw(ss,((SP-4)&0xFFFF),CS);
-        writememw(ss,((SP-6)&0xFFFF),cpu_state.pc); if (cpu_state.abrt) {pclog("abrt6\n"); return 1; }
+        writememw(ss,((SP-6)&0xFFFF),cpu_state.pc);
+	if (cpu_state.abrt) {
+#ifdef ENABLE_386_DYNAREC_LOG
+		x386_dynarec_log("abrt6\n");
+#endif
+		return 1;
+	}
         SP-=6;
 
-        eflags &= ~VIF_FLAG;
-        flags &= ~T_FLAG;
+        cpu_state.eflags &= ~VIF_FLAG;
+        cpu_state.flags &= ~T_FLAG;
         cpu_state.pc = new_pc;
         loadcs(new_cs);
-        oxpc=cpu_state.pc;
+		oxpc=cpu_state.pc;
 
         cycles -= timing_int_rm;
         trap = 0;
@@ -372,6 +395,8 @@ static void prefetch_run(int instr_cycles, int bytes, int modrm, int reads, int 
         }
         
         prefetch_prefixes = 0;
+        if (prefetch_bytes > 16)
+                prefetch_bytes = 16;
 }
 
 static void prefetch_flush()
@@ -382,7 +407,7 @@ static void prefetch_flush()
 #define PREFETCH_RUN(instr_cycles, bytes, modrm, reads, reads_l, writes, writes_l, ea32) \
         do { if (cpu_prefetch_cycles) prefetch_run(instr_cycles, bytes, modrm, reads, reads_l, writes, writes_l, ea32); } while (0)
 
-#define PREFETCH_PREFIX() prefetch_prefixes++
+#define PREFETCH_PREFIX() do { if (cpu_prefetch_cycles) prefetch_prefixes++; } while (0)
 #define PREFETCH_FLUSH() prefetch_flush()
 
 
@@ -403,13 +428,6 @@ int checkio(int port)
 
 int xout=0;
 
-
-#if 0
-#define divexcp() { \
-                pclog("Divide exception at %04X(%06X):%04X\n",CS,cs,cpu_state.pc); \
-                x86_int(0); \
-}
-#endif
 
 #define divexcp() { \
                 x86_int(0); \
@@ -488,74 +506,30 @@ int dontprint=0;
 #include "386_ops.h"
 
 
-#define CACHE_ON() (!(cr0 & (1 << 30)) /*&& (cr0 & 1)*/ && !(flags & T_FLAG))
+#define CACHE_ON() (!(cr0 & (1 << 30)) /*&& (cr0 & 1)*/ && !(cpu_state.flags & T_FLAG))
 
-static int cpu_cycle_period(void)
-{
-	switch(cpu_pci_speed)
-	{
-		case 333333333:
-	                return is_pentium ? 1000 : 1333;
-			break;
-		default:
-	                return 1000;
-			break;
-	}
-}
-
+#ifdef USE_DYNAREC
 static int cycles_main = 0;
+
 void exec386_dynarec(int cycs)
 {
-        uint8_t temp;
+	int vector;
         uint32_t addr;
         int tempi;
         int cycdiff;
         int oldcyc;
 	uint32_t start_pc = 0;
 
+        int cyc_period = cycs / 2000; /*5us*/
+
         cycles_main += cycs;
         while (cycles_main > 0)
         {
                 int cycles_start;
 
-#if 0
-		switch(cpu_pci_speed)
-		{
-			case 16000000:
-		                cycles += 640;
-				break;
-			case 20000000:
-		                cycles += 800;
-				break;
-			case 25000000:
-			default:
-		                cycles += 1000;
-				break;
-			case 27500000:
-		                cycles += 1100;
-				break;
-			case 30000000:
-		                cycles += 1200;
-				break;
-			case 333333333:
-		                cycles += 1333;
-				break;
-			case 37500000:
-		                cycles += 1500;
-				break;
-			case 40000000:
-		                cycles += 1600;
-				break;
-			case 41666667:
-		                cycles += 1666;
-				break;
-		}
-#endif
-		cycles += cpu_cycle_period();
-
+		cycles += cyc_period;
                 cycles_start = cycles;
 
-                timer_start_period(cycles << TIMER_SHIFT);
         while (cycles>0)
         {
                 oldcs = CS;
@@ -569,22 +543,23 @@ void exec386_dynarec(int cycs)
                 if (!CACHE_ON()) /*Interpret block*/
                 {
                         cpu_block_end = 0;
+			x86_was_reset = 0;
                         while (!cpu_block_end)
                         {
                                 oldcs=CS;
                                 cpu_state.oldpc = cpu_state.pc;
-                                oldcpl=CPL;
+								oldcpl = CPL;
                                 cpu_state.op32 = use32;
 
-                                cpu_state.ea_seg = &_ds;
+                                cpu_state.ea_seg = &cpu_state.seg_ds;
                                 cpu_state.ssegs = 0;
                 
                                 fetchdat = fastreadl(cs + cpu_state.pc);
                                 if (!cpu_state.abrt)
                                 {               
-                                        trap = flags & T_FLAG;
-                                        opcode = fetchdat & 0xFF;
-                                        fetchdat >>= 8;
+										opcode = fetchdat & 0xFF;
+										fetchdat >>= 8;
+                                        trap = cpu_state.flags & T_FLAG;
 
                                         cpu_state.pc++;
                                         x86_opcodes[(opcode | cpu_state.op32) & 0x3ff](fetchdat);
@@ -606,8 +581,10 @@ void exec386_dynarec(int cycs)
                                 if (trap)
                                         CPU_BLOCK_END();
 
+                                if (nmi && nmi_enable && nmi_mask)
+                                        CPU_BLOCK_END();
+
                                 ins++;
-                                insc++;
                                 
 /*                                if ((cs + pc) == 4)
                                         fatal("4\n");*/
@@ -621,7 +598,7 @@ void exec386_dynarec(int cycs)
                 int hash = HASH(phys_addr);
                 codeblock_t *block = codeblock_hash[hash];
                 int valid_block = 0;
-                trap = 0;
+				trap = 0;
 
                 if (block && !cpu_state.abrt)
                 {
@@ -631,7 +608,8 @@ void exec386_dynarec(int cycs)
                           and physical address. The physical address check will
                           also catch any page faults at this stage*/
                         valid_block = (block->pc == cs + cpu_state.pc) && (block->_cs == cs) &&
-                                      (block->phys == phys_addr) && (block->status == cpu_cur_status);
+                                      (block->phys == phys_addr) && !((block->status ^ cpu_cur_status) & CPU_STATUS_FLAGS) &&
+                                      ((block->status & cpu_cur_status & CPU_STATUS_MASK) == (cpu_cur_status & CPU_STATUS_MASK));
                         if (!valid_block)
                         {
                                 uint64_t mask = (uint64_t)1 << ((phys_addr >> PAGE_MASK_SHIFT) & PAGE_MASK_MASK);
@@ -643,7 +621,8 @@ void exec386_dynarec(int cycs)
                                         if (new_block)
                                         {
                                                 valid_block = (new_block->pc == cs + cpu_state.pc) && (new_block->_cs == cs) &&
-                                                                (new_block->phys == phys_addr) && (new_block->status == cpu_cur_status);
+                                                                (new_block->phys == phys_addr) && !((new_block->status ^ cpu_cur_status) & CPU_STATUS_FLAGS) &&
+                                                                ((new_block->status & cpu_cur_status & CPU_STATUS_MASK) == (cpu_cur_status & CPU_STATUS_MASK));
                                                 if (valid_block)
                                                         block = new_block;
                                         }
@@ -654,7 +633,7 @@ void exec386_dynarec(int cycs)
                         {
                                 codegen_check_flush(page, page->dirty_mask[(phys_addr >> 10) & 3], phys_addr);
                                 page->dirty_mask[(phys_addr >> 10) & 3] = 0;
-                                if (!block->pc)
+                                if (!block->valid)
                                         valid_block = 0;
                         }
                         if (valid_block && block->page_mask2)
@@ -675,7 +654,7 @@ void exec386_dynarec(int cycs)
                                 {
                                         codegen_check_flush(page_2, page_2->dirty_mask[(phys_addr_2 >> 10) & 3], phys_addr_2);
                                         page_2->dirty_mask[(phys_addr_2 >> 10) & 3] = 0;
-                                        if (!block->pc)
+                                        if (!block->valid)
                                                 valid_block = 0;
                                 }
                         }
@@ -699,9 +678,6 @@ inrecomp=1;
 inrecomp=0;
                         if (!use32) cpu_state.pc &= 0xffff;
                         cpu_recomp_blocks++;
-/*                        ins += codeblock_ins[index];
-                        insc += codeblock_ins[index];*/
-/*                        pclog("Exit block now %04X:%04X\n", CS, pc);*/
                 }
                 else if (valid_block && !cpu_state.abrt)
                 {
@@ -719,18 +695,18 @@ inrecomp=0;
                         {
                                 oldcs=CS;
                                 cpu_state.oldpc = cpu_state.pc;
-                                oldcpl=CPL;
+								oldcpl = CPL;
                                 cpu_state.op32 = use32;
 
-                                cpu_state.ea_seg = &_ds;
+                                cpu_state.ea_seg = &cpu_state.seg_ds;
                                 cpu_state.ssegs = 0;
                 
                                 fetchdat = fastreadl(cs + cpu_state.pc);
                                 if (!cpu_state.abrt)
-                                {               
-                                        trap = flags & T_FLAG;
-                                        opcode = fetchdat & 0xFF;
-                                        fetchdat >>= 8;
+                                { 
+										opcode = fetchdat & 0xFF;
+										fetchdat >>= 8;							
+                                        trap = cpu_state.flags & T_FLAG;
 
                                         cpu_state.pc++;
                                                 
@@ -754,6 +730,9 @@ inrecomp=0;
                                 if (trap)
                                         CPU_BLOCK_END();
 
+                                if (nmi && nmi_enable && nmi_mask)
+                                        CPU_BLOCK_END();
+
 
                                 if (cpu_state.abrt)
                                 {
@@ -762,7 +741,6 @@ inrecomp=0;
                                 }
 
                                 ins++;
-                                insc++;
                         }
                         
                         if (!cpu_state.abrt && !x86_was_reset)
@@ -787,20 +765,20 @@ inrecomp=0;
                         {
                                 oldcs=CS;
                                 cpu_state.oldpc = cpu_state.pc;
-                                oldcpl=CPL;
+								oldcpl = CPL;
                                 cpu_state.op32 = use32;
 
-                                cpu_state.ea_seg = &_ds;
+                                cpu_state.ea_seg = &cpu_state.seg_ds;
                                 cpu_state.ssegs = 0;
                 
                                 codegen_endpc = (cs + cpu_state.pc) + 8;
                                 fetchdat = fastreadl(cs + cpu_state.pc);
 
                                 if (!cpu_state.abrt)
-                                {               
-                                        trap = flags & T_FLAG;
-                                        opcode = fetchdat & 0xFF;
-                                        fetchdat >>= 8;
+                                {         
+										opcode = fetchdat & 0xFF;
+										fetchdat >>= 8;							
+                                        trap = cpu_state.flags & T_FLAG;
 
                                         cpu_state.pc++;
                                                 
@@ -822,6 +800,9 @@ inrecomp=0;
                                 if (trap)
                                         CPU_BLOCK_END();
 
+                                if (nmi && nmi_enable && nmi_mask)
+                                        CPU_BLOCK_END();
+
 
                                 if (cpu_state.abrt)
                                 {
@@ -830,7 +811,6 @@ inrecomp=0;
                                 }
 
                                 ins++;
-                                insc++;
                         }
                         
                         if (!cpu_state.abrt && !x86_was_reset)
@@ -855,21 +835,24 @@ inrecomp=0;
                                 cpu_state.abrt = 0;
                                 CS = oldcs;
                                 cpu_state.pc = cpu_state.oldpc;
-                                pclog("Double fault %i\n", ins);
+#ifdef ENABLE_386_DYNAREC_LOG
+                                x386_dynarec_log("Double fault %i\n", ins);
+#endif
                                 pmodeint(8, 0);
                                 if (cpu_state.abrt)
                                 {
                                         cpu_state.abrt = 0;
                                         softresetx86();
 					cpu_set_edx();
-                                        pclog("Triple fault - reset\n");
+#ifdef ENABLE_386_DYNAREC_LOG
+                                        x386_dynarec_log("Triple fault - reset\n");
+#endif
                                 }
                         }
                 }
                 
                 if (trap)
                 {
-
                         flags_rebuild();
                         if (msw&1)
                         {
@@ -877,57 +860,60 @@ inrecomp=0;
                         }
                         else
                         {
-                                writememw(ss,(SP-2)&0xFFFF,flags);
+                                writememw(ss,(SP-2)&0xFFFF,cpu_state.flags);
                                 writememw(ss,(SP-4)&0xFFFF,CS);
                                 writememw(ss,(SP-6)&0xFFFF,cpu_state.pc);
                                 SP-=6;
                                 addr = (1 << 2) + idt.base;
-                                flags&=~I_FLAG;
-                                flags&=~T_FLAG;
+                                cpu_state.flags&=~I_FLAG;
+                                cpu_state.flags&=~T_FLAG;
                                 cpu_state.pc=readmemw(0,addr);
                                 loadcs(readmemw(0,addr+2));
                         }
                 }
-                else if ((flags&I_FLAG) && pic_intpending)
+                else if (nmi && nmi_enable && nmi_mask)
                 {
-                        temp=picinterrupt();
-                        if (temp!=0xFF)
+                        cpu_state.oldpc = cpu_state.pc;
+                        oldcs = CS;
+                        x86_int(2);
+                        nmi_enable = 0;
+                        if (nmi_auto_clear)
+                        {
+                                nmi_auto_clear = 0;
+                                nmi = 0;
+                        }
+                }
+                else if ((cpu_state.flags&I_FLAG) && pic_intpending)
+                {
+                        vector=picinterrupt();
+                        if (vector!=-1)
                         {
                                 CPU_BLOCK_END();
                                 flags_rebuild();
                                 if (msw&1)
                                 {
-					/* if (temp == 0x0E)
-					{
-						pclog("Servicing FDC interupt (p)!\n");
-					} */
-                                        pmodeint(temp,0);
+                                        pmodeint(vector,0);
                                 }
                                 else
                                 {
-					/* if (temp == 0x0E)
-					{
-						pclog("Servicing FDC interupt (r)!\n");
-					} */
-                                        writememw(ss,(SP-2)&0xFFFF,flags);
+                                        writememw(ss,(SP-2)&0xFFFF,cpu_state.flags);
                                         writememw(ss,(SP-4)&0xFFFF,CS);
                                         writememw(ss,(SP-6)&0xFFFF,cpu_state.pc);
                                         SP-=6;
-                                        addr=temp<<2;
-                                        flags&=~I_FLAG;
-                                        flags&=~T_FLAG;
-                                        oxpc=cpu_state.pc;
+                                        addr=vector<<2;
+                                        cpu_state.flags&=~I_FLAG;
+                                        cpu_state.flags&=~T_FLAG;
+										oxpc=cpu_state.pc;
                                         cpu_state.pc=readmemw(0,addr);
                                         loadcs(readmemw(0,addr+2));
                                 }
                         }
-			/* else
-			{
-				pclog("Servicing pending interrupt 0xFF (!)!\n");
-			} */
                 }
         }
-                timer_end_period(cycles << TIMER_SHIFT);
-                cycles_main -= (cycles_start - cycles);
+			if (TIMER_VAL_LESS_THAN_VAL(timer_target, (uint32_t)tsc))
+				timer_process();
+			
+			cycles_main -= (cycles_start - cycles);
         }
 }
+#endif

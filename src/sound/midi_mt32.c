@@ -1,18 +1,20 @@
+#include <stdio.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
+#include <wchar.h>
 #include "munt/c_interface/c_interface.h"
-#include "../win/plat_thread.h"
-#include "../ibm.h"
+#include "../86box.h"
 #include "../device.h"
 #include "../mem.h"
 #include "../rom.h"
-#include "midi_mt32.h"
-#include "midi.h"
+#include "../plat.h"
 #include "sound.h"
+#include "midi.h"
+#include "midi_mt32.h"
+
 
 extern void givealbuffer_midi(void *buf, uint32_t size);
-extern void pclog(const char *format, ...);
 extern void al_set_midi(int freq, int buf_size);
 
 static const mt32emu_report_handler_i_v0 handler_v0 = {
@@ -60,7 +62,6 @@ mt32emu_return_code mt32_check(const char* func, mt32emu_return_code ret, mt32em
 {
         if (ret != expected)
         {
-                pclog("%s() failed, expected %d but returned %d\n", func, expected, ret);
                 return 0;
         }
         return 1;
@@ -82,6 +83,8 @@ int cm32l_available()
 
 static thread_t *thread_h = NULL;
 static event_t *event = NULL;
+static event_t *start_event = NULL;
+static int mt32_on = 0;
 
 #define RENDER_RATE 100
 #define BUFFER_SEGMENTS 10
@@ -112,39 +115,41 @@ void mt32_poll()
         }
 }
 
-extern int soundon;
-
 static void mt32_thread(void *param)
 {
 	int buf_pos = 0;
 	int bsize = buf_size / BUFFER_SEGMENTS;
-        while (1)
+	float *buf;
+	int16_t *buf16;
+
+	thread_set_event(start_event);
+
+        while (mt32_on)
         {
                 thread_wait_event(event, -1);
+                thread_reset_event(event);
 
 		if (sound_is_float)
 		{
-			float *buf = (float *) ((uint8_t*)buffer + buf_pos);
+			buf = (float *) ((uint8_t*)buffer + buf_pos);
 			memset(buf, 0, bsize);
 			mt32_stream(buf, bsize / (2 * sizeof(float)));
 			buf_pos += bsize;
 			if (buf_pos >= buf_size)
 			{
-		                if (soundon)
-					givealbuffer_midi(buffer, buf_size / sizeof(float));
+				givealbuffer_midi(buffer, buf_size / sizeof(float));
 				buf_pos = 0;
 			}
 		}
 		else
 		{
-			int16_t *buf = (int16_t *) ((uint8_t*)buffer_int16 + buf_pos);
-			memset(buf, 0, bsize);
-			mt32_stream_int16(buf, bsize / (2 * sizeof(int16_t)));
+			buf16 = (int16_t *) ((uint8_t*)buffer_int16 + buf_pos);
+			memset(buf16, 0, bsize);
+			mt32_stream_int16(buf16, bsize / (2 * sizeof(int16_t)));
 			buf_pos += bsize;
 			if (buf_pos >= buf_size)
 			{
-		                if (soundon)
-					givealbuffer_midi(buffer_int16, buf_size / sizeof(int16_t));
+				givealbuffer_midi(buffer_int16, buf_size / sizeof(int16_t));
 				buf_pos = 0;
 			}
 		}
@@ -163,9 +168,12 @@ void mt32_sysex(uint8_t* data, unsigned int len)
 
 void* mt32emu_init(wchar_t *control_rom, wchar_t *pcm_rom)
 {
+	midi_device_t* dev;
         wchar_t s[512];
         char fn[512];
+
         context = mt32emu_create_context(handler, NULL);
+
         if (!rom_getfile(control_rom, s, 512)) return 0;
 	wcstombs(fn, s, (wcslen(s) << 1) + 2);
         if (!mt32_check("mt32emu_add_rom_file", mt32emu_add_rom_file(context, fn), MT32EMU_RC_ADDED_CONTROL_ROM)) return 0;
@@ -175,8 +183,6 @@ void* mt32emu_init(wchar_t *control_rom, wchar_t *pcm_rom)
 
         if (!mt32_check("mt32emu_open_synth", mt32emu_open_synth(context), MT32EMU_RC_OK)) return 0;
 
-        event = thread_create_event();
-        thread_h = thread_create(mt32_thread, 0);
         samplerate = mt32emu_get_actual_stereo_output_samplerate(context);
         /* buf_size = samplerate/RENDER_RATE*2; */
 	if (sound_is_float)
@@ -198,16 +204,9 @@ void* mt32emu_init(wchar_t *control_rom, wchar_t *pcm_rom)
         mt32emu_set_reversed_stereo_enabled(context, device_get_config_int("reversed_stereo"));
         mt32emu_set_nice_amp_ramp_enabled(context, device_get_config_int("nice_ramp"));
 
-        pclog("mt32 output gain: %f\n", mt32emu_get_output_gain(context));
-        pclog("mt32 reverb output gain: %f\n", mt32emu_get_reverb_output_gain(context));
-        pclog("mt32 reverb: %d\n", mt32emu_is_reverb_enabled(context));
-        pclog("mt32 reversed stereo: %d\n", mt32emu_is_reversed_stereo_enabled(context));
-
         al_set_midi(samplerate, buf_size);
 
-        pclog("mt32 (Munt %s) initialized, samplerate %d, buf_size %d\n", mt32emu_get_library_version_string(), samplerate, buf_size);
-
-        midi_device_t* dev = malloc(sizeof(midi_device_t));
+        dev = malloc(sizeof(midi_device_t));
         memset(dev, 0, sizeof(midi_device_t));
 
         dev->play_msg = mt32_msg;
@@ -216,15 +215,25 @@ void* mt32emu_init(wchar_t *control_rom, wchar_t *pcm_rom)
 
         midi_init(dev);
 
+	mt32_on = 1;
+
+	start_event = thread_create_event();
+
+        event = thread_create_event();
+        thread_h = thread_create(mt32_thread, 0);
+
+	thread_wait_event(start_event, -1);
+	thread_reset_event(start_event);
+
         return dev;
 }
 
-void *mt32_init()
+void *mt32_init(const device_t *info)
 {
 	return mt32emu_init(L"roms/sound/mt32/mt32_control.rom", L"roms/sound/mt32/mt32_pcm.rom");
 }
 
-void *cm32l_init()
+void *cm32l_init(const device_t *info)
 {
 	return mt32emu_init(L"roms/sound/cm32l/cm32l_control.rom", L"roms/sound/cm32l/cm32l_pcm.rom");
 }
@@ -233,15 +242,15 @@ void mt32_close(void* p)
 {
         if (!p) return;
 
-        if (thread_h)
-                thread_kill(thread_h);
-        if (event)
-                thread_destroy_event(event);
+	mt32_on = 0;
+	thread_set_event(event);
+	thread_wait(thread_h, -1);
+
         event = NULL;
+	start_event = NULL;
         thread_h = NULL;
 
-        if (context)
-        {
+        if (context) {
                 mt32emu_close_synth(context);
                 mt32emu_free_context(context);
         }
@@ -254,15 +263,9 @@ void mt32_close(void* p)
         if (buffer_int16)
                 free(buffer_int16);
         buffer_int16 = NULL;
-
-        midi_close();
-
-        free((midi_device_t*)p);
-
-        pclog("mt32 closed\n");
 }
 
-static device_config_t mt32_config[] =
+static const device_config_t mt32_config[] =
 {
         {
                 .name = "output_gain",
@@ -309,27 +312,29 @@ static device_config_t mt32_config[] =
         }
 };
 
-device_t mt32_device =
+const device_t mt32_device =
 {
         "Roland MT-32 Emulation",
         0,
+        0,
         mt32_init,
         mt32_close,
+	NULL,
         mt32_available,
-        NULL,
         NULL,
         NULL,
         mt32_config
 };
 
-device_t cm32l_device =
+const device_t cm32l_device =
 {
         "Roland CM-32L Emulation",
         0,
+        0,
         cm32l_init,
         mt32_close,
+	NULL,
         cm32l_available,
-        NULL,
         NULL,
         NULL,
         mt32_config

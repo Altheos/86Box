@@ -6,51 +6,45 @@
  *
  *		Emulation of SCSI fixed and removable disks.
  *
- * Version:	@(#)scsi_disk.h	1.0.1	2017/08/23
+ * Version:	@(#)scsi_disk.h	1.0.7	2018/10/26
  *
  * Author:	Miran Grca, <mgrca8@gmail.com>
- *		Copyright 2017 Miran Grca.
+ *		Copyright 2017,2018 Miran Grca.
  */
 
-#pragma pack(push,1)
+
 typedef struct {
-	/* Stuff for SCSI hard disks. */
-	uint8_t cdb[16];
-	uint8_t current_cdb[16];
-	uint8_t max_cdb_len;
-	int requested_blocks;
-	int max_blocks_at_once;
-	uint16_t request_length;
-	int block_total;
-	int all_blocks_total;
-	uint32_t packet_len;
-	int packet_status;
-	uint8_t status;
-	uint8_t phase;
-	uint32_t pos;
-	int callback;
-	int total_read;
-	int unit_attention;
-	uint8_t sense[256];
-	uint8_t previous_command;
-	uint8_t error;
-	uint32_t sector_pos;
-	uint32_t sector_len;
-	uint32_t seek_pos;
-	int data_pos;
-	int old_len;
-	int request_pos;
-	uint8_t hd_cdb[16];
-} scsi_hard_disk_t;
-#pragma pack(pop)
+    mode_sense_pages_t ms_pages_saved;
 
-extern scsi_hard_disk_t shdc[HDC_NUM];
+    hard_disk_t *drv;
 
-extern void	scsi_disk_insert(uint8_t id);
-extern void	scsi_loadhd(int scsi_id, int scsi_lun, int id);
-extern void	scsi_reloadhd(int id);
-extern void	scsi_unloadhd(int scsi_id, int scsi_lun, int id);
+    uint8_t *temp_buffer,
+	    pad[16],	/* This is atapi_cdb in ATAPI-supporting devices,
+			   and pad in SCSI-only devices. */
+	    current_cdb[16],
+	    sense[256];
 
-extern FILE *shdf[HDC_NUM];
+    uint8_t status, phase,
+	    error, id,
+	    pad0, pad1,
+	    pad2, pad3;
 
-int scsi_hd_read_capacity(uint8_t id, uint8_t *cdb, uint8_t *buffer, uint32_t *len);
+    uint16_t request_length, pad4;
+
+    int requested_blocks, packet_status,
+	total_length, do_page_save,
+	unit_attention, pad5,
+	pad6, pad7;
+
+    uint32_t sector_pos, sector_len,
+	     packet_len, pos;
+
+    double callback;
+} scsi_disk_t;
+
+
+extern scsi_disk_t *scsi_disk[HDD_NUM];
+
+
+extern void	scsi_disk_hard_reset(void);
+extern void	scsi_disk_close(void);

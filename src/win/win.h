@@ -6,112 +6,193 @@
  *
  *		This file is part of the 86Box distribution.
  *
- *		The Emulator's Windows core.
+ *		Platform support defintions for Win32.
  *
- * Version:	@(#)win.h	1.0.0	2017/05/30
+ * Version:	@(#)win.h	1.0.29	2019/12/05
  *
- * Author:	Sarah Walker, <http://pcem-emulator.co.uk/>
+ * Authors:	Sarah Walker, <http://pcem-emulator.co.uk/>
  *		Miran Grca, <mgrca8@gmail.com>
- *		Copyright 2008-2017 Sarah Walker.
- *		Copyright 2016-2017 Miran Grca.
+ *		Fred N. van Kempen, <decwiz@yahoo.com>
+ *
+ *		Copyright 2008-2019 Sarah Walker.
+ *		Copyright 2016-2019 Miran Grca.
+ *		Copyright 2017-2019 Fred N. van Kempen.
  */
+#ifndef PLAT_WIN_H
+# define PLAT_WIN_H
 
-/*
- * This should be named 'plat.h' and then include any 
- * Windows-specific header files needed, to keep them
- * out of the main code.
- */
-/* Copyright holders: Sarah Walker
-   see COPYING for more details
-*/
-#ifndef BOX_WIN_H
-# define BOX_WIN_H
-
-# ifndef NO_UNICODE
-#  define UNICODE
-# endif
+# define UNICODE
 # define BITMAP WINDOWS_BITMAP
-/* # ifdef _WIN32_WINNT
-   #  undef _WIN32_WINNT
-   #  define _WIN32_WINNT 0x0501
-   # endif */
+# if 0
+#  ifdef _WIN32_WINNT
+#   undef _WIN32_WINNT
+#   define _WIN32_WINNT 0x0501
+#  endif
+# endif
 # include <windows.h>
 # include "resource.h"
 # undef BITMAP
 
 
-#define szClassName L"86BoxMainWnd"
-#define szSubClassName L"86BoxSubWnd"
-#define szStatusBarClassName L"86BoxStatusBar"
+/* Class names and such. */
+#define CLASS_NAME		L"86BoxMainWnd"
+#define MENU_NAME		L"MainMenu"
+#define ACCEL_NAME		L"MainAccel"
+#define SUB_CLASS_NAME		L"86BoxSubWnd"
+#define SB_CLASS_NAME		L"86BoxStatusBar"
+#define SB_MENU_NAME		L"StatusBarMenu"
+#define FS_CLASS_NAME		L"86BoxFullScreen"
 
+/* Application-specific window messages.
 
-#define WM_RESETD3D WM_USER
-#define WM_LEAVEFULLSCREEN WM_USER + 1
+   A dialog sends 0x8895 with WPARAM = 1 followed by 0x8896 with WPARAM = 1 on open,
+   and 0x8895 with WPARAM = <previous pause status> followed by 0x8896 with WPARAM = 0.
 
-#define WM_SAVESETTINGS 0x8888			/* 86Box-specific message, used to tell the child dialog to save the currently specified settings. */
+   All shutdowns will send an 0x8897. */
+#define WM_LEAVEFULLSCREEN	WM_USER
+#define WM_SAVESETTINGS		0x8888
+#define WM_SHOWSETTINGS		0x8889
+#define WM_PAUSE		0x8890
+#define WM_SENDHWND		0x8891
+#define WM_HARDRESET		0x8892
+#define WM_SHUTDOWN		0x8893
+#define WM_CTRLALTDEL		0x8894
+/* Pause/resume status: WPARAM = 1 for paused, 0 for resumed. */
+#define WM_SENDSTATUS		0x8895
+/* Dialog (Settings or message box) status: WPARAM = 1 for open, 0 for closed. */
+#define WM_SENDDLGSTATUS	0x8896
+/* The emulator has shut down. */
+#define WM_HAS_SHUTDOWN		0x8897
 
-#define SB_ICON_WIDTH 24
+#ifdef USE_VNC
+#ifdef USE_D2D
+#define RENDERERS_NUM		4
+#else
+#define RENDERERS_NUM		3
+#endif
+#else
+#ifdef USE_D2D
+#define RENDERERS_NUM		3
+#else
+#define RENDERERS_NUM		2
+#endif
+#endif
 
 
 extern HINSTANCE	hinstance;
-extern HWND		ghwnd;
-extern HWND		status_hwnd;
-extern HWND		hwndStatus;
-extern int		status_is_open;
-extern int		mousecapture;
+extern HWND		hwndMain,
+			hwndRender;
+extern HANDLE		ghMutex;
+extern LCID		lang_id;
+extern HICON		hIcon[256];
+
+// extern int		status_is_open;
 
 extern char		openfilestring[260];
 extern WCHAR		wopenfilestring[260];
 
-extern int		pause;
-
-extern HMENU		smenu;
-extern HMENU		*sb_menu_handles;
+extern uint8_t		filterindex;
 
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-extern void	leave_fullscreen(void);
+#ifdef USE_CRASHDUMP
+extern void	InitCrashDump(void);
+#endif
 
-extern void	status_open(HWND hwnd);
+extern HICON	LoadIconEx(PCTSTR pszIconName);
 
-extern void	deviceconfig_open(HWND hwnd, struct device_t *device);
-extern void	joystickconfig_open(HWND hwnd, int joy_nr, int type);
+/* Emulator start/stop support functions. */
+extern void	do_start(void);
+extern void	do_stop(void);
+
+/* Internal platform support functions. */
+extern void	set_language(int id);
+extern int	get_vidpause(void);
+extern void	show_cursor(int);
+
+extern void	keyboard_getkeymap(void);
+extern void	keyboard_handle(LPARAM lParam, int infocus);
+
+extern void     win_mouse_init(void);
+extern void     win_mouse_close(void);
+#ifndef USE_DINPUT
+extern void     win_mouse_handle(LPARAM lParam, int infocus);
+#endif
+
+extern void     win_notify_dlg_open(void);
+extern void     win_notify_dlg_closed(void);
+
+extern LPARAM	win_get_string(int id);
+
+extern intptr_t	fdd_type_to_icon(int type);
+
+#ifdef EMU_DEVICE_H
+extern uint8_t	deviceconfig_open(HWND hwnd, const device_t *device);
+extern uint8_t	deviceconfig_inst_open(HWND hwnd, const device_t *device, int inst);
+#endif
+extern uint8_t	joystickconfig_open(HWND hwnd, int joy_nr, int type);
 
 extern int	getfile(HWND hwnd, char *f, char *fn);
 extern int	getsfile(HWND hwnd, char *f, char *fn);
 
-extern void	get_executable_name(wchar_t *s, int size);
-extern void	set_window_title(wchar_t *s);
-
-extern void	startblit(void);
-extern void	endblit(void);
-
-extern void	win_settings_open(HWND hwnd);
-extern void	win_menu_update();
-
-extern void	update_status_bar_panes(HWND hwnds);
-
-extern int	fdd_type_to_icon(int type);
-
 extern void	hard_disk_add_open(HWND hwnd, int is_existing);
 extern int	hard_disk_was_added(void);
 
-extern void	get_registry_key_map(void);
-extern void	process_raw_input(LPARAM lParam, int infocus);
 
-extern int	find_status_bar_part(int tag);
+/* Platform UI support functions. */
+extern int	ui_init(int nCmdShow);
+extern void	plat_set_input(HWND h);
 
-extern void	cdrom_close(uint8_t id);
-extern void	update_tip(int meaning);
 
-extern BOOL	DirectoryExists(LPCTSTR szPath);
+/* Functions in win_about.c: */
+extern void	AboutDialogCreate(HWND hwnd);
+
+
+/* Functions in win_snd_gain.c: */
+extern void	SoundGainDialogCreate(HWND hwnd);
+
+
+/* Functions in win_new_floppy.c: */
+extern void	NewFloppyDialogCreate(HWND hwnd, int id, int part);
+
+
+/* Functions in win_settings.c: */
+#define SETTINGS_PAGE_MACHINE			0
+#define SETTINGS_PAGE_VIDEO			1
+#define SETTINGS_PAGE_INPUT			2
+#define SETTINGS_PAGE_SOUND			3
+#define SETTINGS_PAGE_NETWORK			4
+#define SETTINGS_PAGE_PORTS			5
+#define SETTINGS_PAGE_PERIPHERALS		6
+#define SETTINGS_PAGE_HARD_DISKS		7
+#define SETTINGS_PAGE_FLOPPY_DRIVES		8
+#define SETTINGS_PAGE_OTHER_REMOVABLE_DEVICES	9
+
+extern void	win_settings_open(HWND hwnd);
+extern void	win_settings_open_ex(HWND hwnd, int category);
+
+
+/* Functions in win_stbar.c: */
+extern HWND	hwndSBAR;
+extern void	StatusBarCreate(HWND hwndParent, uintptr_t idStatus, HINSTANCE hInst);
+
+
+/* Functions in win_dialog.c: */
+extern int	file_dlg_w(HWND hwnd, WCHAR *f, WCHAR *fn, int save);
+extern int	file_dlg(HWND hwnd, WCHAR *f, char *fn, int save);
+extern int	file_dlg_mb(HWND hwnd, char *f, char *fn, int save);
+extern int	file_dlg_w_st(HWND hwnd, int i, WCHAR *fn, int save);
+extern int	file_dlg_st(HWND hwnd, int i, char *fn, int save);
+
+extern wchar_t	*BrowseFolder(wchar_t *saved_path, wchar_t *title);
+
 
 #ifdef __cplusplus
 }
 #endif
 
 
-#endif	/*BOX_WIN_H*/
+#endif	/*PLAT_WIN_H*/

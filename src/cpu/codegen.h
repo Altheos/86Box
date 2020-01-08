@@ -1,3 +1,39 @@
+/*
+ * VARCem	Virtual ARchaeological Computer EMulator.
+ *		An emulator of (mostly) x86-based PC systems and devices,
+ *		using the ISA,EISA,VLB,MCA  and PCI system buses, roughly
+ *		spanning the era between 1981 and 1995.
+ *
+ *		This file is part of the VARCem Project.
+ *
+ *		Definitions for the code generator.
+ *
+ * Version:	@(#)codegen.h	1.0.2	2018/03/14
+ *
+ * Authors:	Sarah Walker, <tommowalker@tommowalker.co.uk>
+ *		Miran Grca, <mgrca8@gmail.com>
+ *
+ *		Copyright 2008-2018 Sarah Walker.
+ *		Copyright 2016-2018 Miran Grca.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free  Software  Foundation; either  version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is  distributed in the hope that it will be useful, but
+ * WITHOUT   ANY  WARRANTY;  without  even   the  implied  warranty  of
+ * MERCHANTABILITY  or FITNESS  FOR A PARTICULAR  PURPOSE. See  the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the:
+ *
+ *   Free Software Foundation, Inc.
+ *   59 Temple Place - Suite 330
+ *   Boston, MA 02111-1307
+ *   USA.
+ */
 #ifndef _CODEGEN_H_
 #define _CODEGEN_H_
 
@@ -6,7 +42,7 @@
 
 #ifdef __amd64__
 #include "codegen_x86-64.h"
-#elif defined i386 || defined __i386 || defined __i386__ || defined _X86_ || defined WIN32 || defined _WIN32 || defined _WIN32
+#elif defined i386 || defined __i386 || defined __i386__ || defined _X86_ || defined _M_IX86 || defined _M_X64
 #include "codegen_x86.h"
 #else
 #error Dynamic recompiler not implemented on your platform
@@ -55,7 +91,9 @@ typedef struct codeblock_t
         
         int pnt;
         int ins;
-        
+
+	int valid;
+
         int was_recompiled;
         int TOP;
 
@@ -82,8 +120,12 @@ static inline codeblock_t *codeblock_tree_find(uint32_t phys, uint32_t _cs)
         while (block)
         {
                 if (a == block->cmp)
-                        break;
-                else if (a < block->cmp)
+                {
+                        if (!((block->status ^ cpu_cur_status) & CPU_STATUS_FLAGS) &&
+                             ((block->status & cpu_cur_status & CPU_STATUS_MASK) == (cpu_cur_status & CPU_STATUS_MASK)))
+                                break;
+                }
+                if (a < block->cmp)
                         block = block->left;
                 else
                         block = block->right;
@@ -261,7 +303,7 @@ void codegen_generate_call(uint8_t opcode, OpFn op, uint32_t fetchdat, uint32_t 
 void codegen_generate_seg_restore();
 void codegen_set_op32();
 void codegen_flush();
-void codegen_check_flush(struct page_t *page, uint64_t mask, uint32_t phys_addr);
+void codegen_check_flush(page_t *page, uint64_t mask, uint32_t phys_addr);
 
 extern int cpu_block_end;
 extern uint32_t codegen_endpc;

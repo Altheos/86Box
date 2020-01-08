@@ -1,327 +1,367 @@
-/*
- * 86Box	A hypervisor and IBM PC system emulator that specializes in
- *		running old operating systems and software designed for IBM
- *		PC systems and compatibles from 1981 through fairly recent
- *		system designs based on the PCI bus.
+﻿/*
+ * VARCem	Virtual ARchaeological Computer EMulator.
+ *		An emulator of (mostly) x86-based PC systems and devices,
+ *		using the ISA,EISA,VLB,MCA  and PCI system buses, roughly
+ *		spanning the era between 1981 and 1995.
  *
- *		This file is part of the 86Box distribution.
+ *		This file is part of the VARCem Project.
  *
- *		CMOS NVRAM emulation.
+ *		Implement a generic NVRAM/CMOS/RTC device.
  *
- * Version:	@(#)nvr.c	1.0.1	2017/06/03
+ * Version:	@(#)nvr.c	1.0.19	2019/11/19
  *
- * Authors:	Sarah Walker, <http://pcem-emulator.co.uk/>
- *		Miran Grca, <mgrca8@gmail.com>
- *		Mahod,
- *		Copyright 2008-2017 Sarah Walker.
- *		Copyright 2016-2017 Miran Grca.
- *		Copyright 2016-2017 Mahod.
+ * Authors:	Fred N. van Kempen, <decwiz@yahoo.com>,
+ * 		David Hrdlička, <hrdlickadavid@outlook.com>
+ *
+ *		Copyright 2017-2019 Fred N. van Kempen.
+ *		Copyright 2018,2019 David Hrdlička.
+ *
+ *		Redistribution and  use  in source  and binary forms, with
+ *		or  without modification, are permitted  provided that the
+ *		following conditions are met:
+ *
+ *		1. Redistributions of  source  code must retain the entire
+ *		   above notice, this list of conditions and the following
+ *		   disclaimer.
+ *
+ *		2. Redistributions in binary form must reproduce the above
+ *		   copyright  notice,  this list  of  conditions  and  the
+ *		   following disclaimer in  the documentation and/or other
+ *		   materials provided with the distribution.
+ *
+ *		3. Neither the  name of the copyright holder nor the names
+ *		   of  its  contributors may be used to endorse or promote
+ *		   products  derived from  this  software without specific
+ *		   prior written permission.
+ *
+ * THIS SOFTWARE  IS  PROVIDED BY THE  COPYRIGHT  HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND  ANY EXPRESS  OR  IMPLIED  WARRANTIES,  INCLUDING, BUT  NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+ * PARTICULAR PURPOSE  ARE  DISCLAIMED. IN  NO  EVENT  SHALL THE COPYRIGHT
+ * HOLDER OR  CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL,  EXEMPLARY,  OR  CONSEQUENTIAL  DAMAGES  (INCLUDING,  BUT  NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE  GOODS OR SERVICES;  LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED  AND ON  ANY
+ * THEORY OF  LIABILITY, WHETHER IN  CONTRACT, STRICT  LIABILITY, OR  TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING  IN ANY  WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#include <stdarg.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
 #include <wchar.h>
-#include "ibm.h"
-#include "cpu/cpu.h"
-#include "device.h"
-#include "io.h"
-#include "jim.h"
+#define HAVE_STDARG_H
+#include "86box.h"
+#include "machine/machine.h"
 #include "mem.h"
-#include "model.h"
-#include "nmi.h"
-#include "nvr.h"
-#include "pic.h"
-#include "rom.h"
 #include "timer.h"
-#include "rtc.h"
+#include "plat.h"
+#include "nvr.h"
 
 
-int oldmodel;
-int nvrmask=63;
-char nvrram[128];
-int nvraddr;
-int nvr_dosave = 0;
-
-static int nvr_onesec_time = 0, nvr_onesec_cnt = 0;
-static int rtctime;
+int	nvr_dosave;		/* NVR is dirty, needs saved */
 
 
-void getnvrtime(void)
+static int8_t	days_in_month[12] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+static struct tm intclk;
+static nvr_t	*saved_nvr = NULL;
+
+
+#ifdef ENABLE_NVR_LOG
+int nvr_do_log = ENABLE_NVR_LOG;
+
+
+static void
+nvr_log(const char *fmt, ...)
 {
-	time_get(nvrram);
+    va_list ap;
+
+    if (nvr_do_log) {
+	va_start(ap, fmt);
+	pclog_ex(fmt, ap);
+	va_end(ap);
+    }
+}
+#else
+#define nvr_log(fmt, ...)
+#endif
+
+
+/* Determine whether or not the year is leap. */
+int
+nvr_is_leap(int year)
+{
+    if (year % 400 == 0) return(1);
+    if (year % 100 == 0) return(0);
+    if (year % 4 == 0) return(1);
+
+    return(0);
 }
 
-void nvr_recalc(void)
+
+/* Determine the days in the current month. */
+int
+nvr_get_days(int month, int year)
 {
-        int c;
-        int newrtctime;
-        c = 1 << ((nvrram[RTC_REGA] & RTC_RS) - 1);
-        newrtctime=(int)(RTCCONST * c * (1 << TIMER_SHIFT));
-        if (rtctime>newrtctime) rtctime=newrtctime;
+    if (month != 2)
+	return(days_in_month[month - 1]);
+
+    return(nvr_is_leap(year) ? 29 : 28);
 }
 
-void nvr_rtc(void *p)
+
+/* One more second has passed, update the internal clock. */
+void
+rtc_tick(void)
 {
-        int c;
-        if (!(nvrram[RTC_REGA] & RTC_RS))
-        {
-                rtctime=0x7fffffff;
-                return;
-        }
-        c = 1 << ((nvrram[RTC_REGA] & RTC_RS) - 1);
-        rtctime += (int)(RTCCONST * c * (1 << TIMER_SHIFT));
-        nvrram[RTC_REGC] |= RTC_PF;
-        if (nvrram[RTC_REGB] & RTC_PIE)
-        {
-                nvrram[RTC_REGC] |= RTC_IRQF;
-                if (AMSTRAD) picint(2);
-                else         picint(0x100);
-        }
-}
-
-int nvr_update_status = 0;
-
-#define ALARM_DONTCARE	0xc0
-
-int nvr_check_alarm(int nvraddr)
-{
-        return (nvrram[nvraddr + 1] == nvrram[nvraddr] || (nvrram[nvraddr + 1] & ALARM_DONTCARE) == ALARM_DONTCARE);
-}
-
-int nvr_update_end_count = 0;
-
-void nvr_update_end(void *p)
-{
-        if (!(nvrram[RTC_REGB] & RTC_SET))
-        {
-                getnvrtime();
-                /* Clear update status. */
-                nvr_update_status = 0;
-
-                if (nvr_check_alarm(RTC_SECONDS) && nvr_check_alarm(RTC_MINUTES) && nvr_check_alarm(RTC_HOURS))
-                {
-                        nvrram[RTC_REGC] |= RTC_AF;
-                        if (nvrram[RTC_REGB] & RTC_AIE)
-                        {
-                                nvrram[RTC_REGC] |= RTC_IRQF;
-                                if (AMSTRAD) picint(2);
-                                else         picint(0x100);
-                        }
-                }
-
-                /* The flag and interrupt should be issued on update ended, not started. */
-                nvrram[RTC_REGC] |= RTC_UF;
-                if (nvrram[RTC_REGB] & RTC_UIE)
-                {
-                        nvrram[RTC_REGC] |= RTC_IRQF;
-                        if (AMSTRAD) picint(2);
-                        else         picint(0x100);
-                }
-        }
-
-        nvr_update_end_count = 0;
-}
-
-void nvr_onesec(void *p)
-{
-        nvr_onesec_cnt++;
-        if (nvr_onesec_cnt >= 100)
-        {
-                if (!(nvrram[RTC_REGB] & RTC_SET))
-                {
-                        nvr_update_status = RTC_UIP;
-                        rtc_tick();
-
-                        nvr_update_end_count = (int)((244.0 + 1984.0) * TIMER_USEC);
-                }
-                nvr_onesec_cnt = 0;
-        }
-        nvr_onesec_time += (int)(10000 * TIMER_USEC);
-}
-
-void writenvr(uint16_t addr, uint8_t val, void *priv)
-{
-        int c, old;
-        if (addr&1)
-        {
-                if (nvraddr==RTC_REGC || nvraddr==RTC_REGD)
-                        return; /* Registers C and D are read-only. There's no reason to continue. */
-                if (nvraddr > RTC_REGD && nvrram[nvraddr] != val)
-                   nvr_dosave = 1;
-                
-		old = nvrram[nvraddr];
-                nvrram[nvraddr]=val;
-
-                if (nvraddr == RTC_REGA)
-                {
-                        if (val & RTC_RS)
-                        {
-                                c = 1 << ((val & RTC_RS) - 1);
-                                rtctime += (int)(RTCCONST * c * (1 << TIMER_SHIFT));
-                        }
-                        else
-                           rtctime = 0x7fffffff;
-                }
-		else
-		{
-                        if (nvraddr == RTC_REGB)
-                        {
-                                if (((old ^ val) & RTC_SET) && (val & RTC_SET))
-                                {
-                                        nvrram[RTC_REGA] &= ~RTC_UIP;             /* This has to be done according to the datasheet. */
-                                        nvrram[RTC_REGB] &= ~RTC_UIE;             /* This also has to happen per the specification. */
-                                }
-                        }
-
-                        if ((nvraddr < RTC_REGA) || (nvraddr == RTC_CENTURY))
-                        {
-                                if ((nvraddr != 1) && (nvraddr != 3) && (nvraddr != 5))
-                                {
-                                        if ((old != val) && !enable_sync)
-                                        {
-                                                time_update(nvrram, nvraddr);
-                                                nvr_dosave = 1;
-                                        }
-                                }
-                        }
-                }
-        }
-        else
-        {
-                nvraddr=val&nvrmask;
-                nmi_mask = ~val & 0x80;
-        }
-}
-
-uint8_t readnvr(uint16_t addr, void *priv)
-{
-        uint8_t temp;
-        if (addr&1)
-        {
-                if (nvraddr == RTC_REGA)
-                        return ((nvrram[RTC_REGA] & 0x7F) | nvr_update_status);
-                if (nvraddr == RTC_REGD)
-                        nvrram[RTC_REGD] |= RTC_VRT;
-                if (nvraddr == RTC_REGC)
-                {
-                        if (AMSTRAD) picintc(2);
-                        else         picintc(0x100);
-                        temp = nvrram[RTC_REGC];
-                        nvrram[RTC_REGC] = 0;
-                        return temp;
-                }
-                return nvrram[nvraddr];
-        }
-        return nvraddr;
-}
-
-void loadnvr(void)
-{
-        FILE *f = NULL;
-        int c;
-        nvrmask=63;
-        oldmodel = model;
-
-	wchar_t *model_name;
-	wchar_t *nvr_name;
-
-	model_name = (wchar_t *) malloc((strlen(model_get_internal_name_ex(model)) << 1) + 2);
-	mbstowcs(model_name, model_get_internal_name_ex(model), strlen(model_get_internal_name_ex(model)) + 1);
-	nvr_name = (wchar_t *) malloc((wcslen(model_name) << 1) + 2 + 8);
-	_swprintf(nvr_name, L"%s.nvr", model_name);
-
-	pclog_w(L"Opening NVR file: %s...\n", nvr_name);
-
-	if (model_get_nvrmask(model) != 0)
-	{
-		f = nvrfopen(nvr_name, L"rb");
-		nvrmask = model_get_nvrmask(model);
-	}
-
-        if (!f || (model_get_nvrmask(model) == 0))
-        {
-		if (f)
-		{
-			fclose(f);
+    /* Ping the internal clock. */
+    if (++intclk.tm_sec == 60) {
+	intclk.tm_sec = 0;
+	if (++intclk.tm_min == 60) {
+		intclk.tm_min = 0;
+    		if (++intclk.tm_hour == 24) {
+			intclk.tm_hour = 0;
+    			if (++intclk.tm_mday == (nvr_get_days(intclk.tm_mon,
+							intclk.tm_year) + 1)) {
+				intclk.tm_mday = 1;
+    				if (++intclk.tm_mon == 13) {
+					intclk.tm_mon = 1;
+					intclk.tm_year++;
+				 }
+			}
 		}
-                memset(nvrram,0xFF,128);
-                if (!enable_sync)
-                {
-                        nvrram[RTC_SECONDS] = nvrram[RTC_MINUTES] = nvrram[RTC_HOURS] = 0;
-                        nvrram[RTC_DOM] = nvrram[RTC_MONTH] = 1;
-                        nvrram[RTC_YEAR] = (char) BCD(80);
-                        nvrram[RTC_CENTURY] = BCD(19);
-                        nvrram[RTC_REGB] = RTC_2412;
-                }
-
-		free(nvr_name);
-		free(model_name);
-                return;
-        }
-        fread(nvrram,128,1,f);
-        if (enable_sync)
-                time_internal_sync(nvrram);
-        else
-                time_internal_set_nvrram(nvrram); /* Update the internal clock state based on the NVR registers. */
-        fclose(f);
-        nvrram[RTC_REGA] = 6;
-        nvrram[RTC_REGB] = RTC_2412;
-        c = 1 << ((nvrram[RTC_REGA] & RTC_RS) - 1);
-        rtctime += (int)(RTCCONST * c * (1 << TIMER_SHIFT));
-
-	free(nvr_name);
-	free(model_name);
+	}
+    }
 }
 
-void savenvr(void)
+
+/* This is the RTC one-second timer. */
+static void
+onesec_timer(void *priv)
 {
-        FILE *f = NULL;
+    nvr_t *nvr = (nvr_t *)priv;
 
-	wchar_t *model_name;
-	wchar_t *nvr_name;
+    if (++nvr->onesec_cnt >= 100) {
+	/* Update the internal clock. */
+	if (!(machines[machine].flags & MACHINE_AT))
+		rtc_tick();
 
-	if (romset == ROM_EUROPC)
-	{
-		jim_save_nvr();
-		return;
-	}
+	/* Update the RTC device if needed. */
+	if (nvr->tick != NULL)
+		(*nvr->tick)(nvr);
 
-	model_name = (wchar_t *) malloc((strlen(model_get_internal_name_ex(oldmodel)) << 1) + 2);
-	mbstowcs(model_name, model_get_internal_name_ex(oldmodel), strlen(model_get_internal_name_ex(oldmodel)) + 1);
-	nvr_name = (wchar_t *) malloc((wcslen(model_name) << 1) + 2 + 8);
-	_swprintf(nvr_name, L"%s.nvr", model_name);
+	nvr->onesec_cnt = 0;
+    }
 
-	pclog_w(L"Saving NVR file: %s...\n", nvr_name);
-
-	if (model_get_nvrmask(oldmodel) != 0)
-	{
-		f = nvrfopen(nvr_name, L"wb");
-	}
-
-	if (!f || (model_get_nvrmask(oldmodel) == 0))
-	{
-		if (f)
-		{
-			fclose(f);
-		}
-
-		free(nvr_name);
-		free(model_name);
-		return;
-	}
-
-        fwrite(nvrram,128,1,f);
-        fclose(f);
-
-	free(nvr_name);
-	free(model_name);
+    timer_advance_u64(&nvr->onesec_time, (uint64_t)(10000ULL * TIMER_USEC));
 }
 
-void nvr_init(void)
-{
-        io_sethandler(0x0070, 0x0002, readnvr, NULL, NULL, writenvr, NULL, NULL,  NULL);
-        timer_add(nvr_rtc, &rtctime, TIMER_ALWAYS_ENABLED, NULL);
-        timer_add(nvr_onesec, &nvr_onesec_time, TIMER_ALWAYS_ENABLED, NULL);
-        timer_add(nvr_update_end, &nvr_update_end_count, &nvr_update_end_count, NULL);
 
+/* Initialize the generic NVRAM/RTC device. */
+void
+nvr_init(nvr_t *nvr)
+{
+    char temp[64];
+    struct tm *tm;
+    time_t now;
+    int c;
+
+    /* Set up the NVR file's name. */
+    sprintf(temp, "%s.nvr", machine_get_internal_name());
+    c = strlen(temp);
+    nvr->fn = (wchar_t *)malloc((c + 1) * sizeof(wchar_t));
+    mbstowcs(nvr->fn, temp, c + 1);
+
+    /* Initialize the internal clock as needed. */
+    memset(&intclk, 0x00, sizeof(intclk));
+    if (time_sync & TIME_SYNC_ENABLED) {
+	/* Get the current time of day, and convert to local time. */
+	(void)time(&now);
+	if(time_sync & TIME_SYNC_UTC)
+		tm = gmtime(&now);
+	else
+		tm = localtime(&now);
+
+	/* Set the internal clock. */
+	nvr_time_set(tm);
+    } else {
+	/* Reset the internal clock to 1980/01/01 00:00. */
+	intclk.tm_mon = 1;
+	intclk.tm_year = 1980;
+    }
+
+    /* Set up our timer. */
+    timer_add(&nvr->onesec_time, onesec_timer, nvr, 1);
+
+    /* It does not need saving yet. */
+    nvr_dosave = 0;
+
+    /* Save the NVR data pointer. */
+    saved_nvr = nvr;
+
+    /* Try to load the saved data. */
+    (void)nvr_load();
+}
+
+
+/* Get path to the NVR folder. */
+wchar_t *
+nvr_path(wchar_t *str)
+{
+    static wchar_t temp[1024];
+
+    /* Get the full prefix in place. */
+    memset(temp, 0x00, sizeof(temp));
+    wcscpy(temp, usr_path);
+    wcscat(temp, NVR_PATH);
+
+    /* Create the directory if needed. */
+    if (! plat_dir_check(temp))
+	plat_dir_create(temp);
+
+    /* Now append the actual filename. */
+    plat_path_slash(temp);
+    wcscat(temp, str);
+
+    return(temp);
+}
+
+
+/*
+ * Load an NVR from file.
+ *
+ * This function does two things, really. It clears and initializes
+ * the RTC and NVRAM areas, sets up defaults for the RTC part, and
+ * then attempts to load data from a saved file.
+ *
+ * Either way, after that, it will continue to configure the local
+ * RTC to operate, so it can update either the local RTC, and/or
+ * the one supplied by a client.
+ */
+int
+nvr_load(void)
+{
+    wchar_t *path;
+    FILE *fp;
+
+    /* Make sure we have been initialized. */
+    if (saved_nvr == NULL) return(0);
+
+    /* Clear out any old data. */
+    memset(saved_nvr->regs, 0x00, sizeof(saved_nvr->regs));
+
+    /* Set the defaults. */
+    if (saved_nvr->reset != NULL)
+	saved_nvr->reset(saved_nvr);
+
+    /* Load the (relevant) part of the NVR contents. */
+    if (saved_nvr->size != 0) {
+	path = nvr_path(saved_nvr->fn);
+	nvr_log("NVR: loading from '%ls'\n", path);
+	fp = plat_fopen(path, L"rb");
+	if (fp != NULL) {
+		/* Read NVR contents from file. */
+		(void)fread(saved_nvr->regs, saved_nvr->size, 1, fp);
+		(void)fclose(fp);
+	}
+    }
+
+    /* Get the local RTC running! */
+    if (saved_nvr->start != NULL)
+	saved_nvr->start(saved_nvr);
+
+    return(1);
+}
+
+
+void
+nvr_set_ven_save(void (*ven_save)(void))
+{
+    saved_nvr->ven_save = ven_save;
+}
+
+
+/* Save the current NVR to a file. */
+int
+nvr_save(void)
+{
+    wchar_t *path;
+    FILE *fp;
+
+    /* Make sure we have been initialized. */
+    if (saved_nvr == NULL) return(0);
+
+    if (saved_nvr->size != 0) {
+	path = nvr_path(saved_nvr->fn);
+	nvr_log("NVR: saving to '%ls'\n", path);
+	fp = plat_fopen(path, L"wb");
+	if (fp != NULL) {
+		/* Save NVR contents to file. */
+		(void)fwrite(saved_nvr->regs, saved_nvr->size, 1, fp);
+		fclose(fp);
+	}
+    }
+
+    if (saved_nvr->ven_save)
+	saved_nvr->ven_save();
+
+    /* Device is clean again. */
+    nvr_dosave = 0;
+
+    return(1);
+}
+
+
+void
+nvr_close(void)
+{
+    saved_nvr = NULL;
+}
+
+
+/* Get current time from internal clock. */
+void
+nvr_time_get(struct tm *tm)
+{
+    uint8_t dom, mon, sum, wd;
+    uint16_t cent, yr;
+
+    tm->tm_sec = intclk.tm_sec;
+    tm->tm_min = intclk.tm_min;
+    tm->tm_hour = intclk.tm_hour;
+     dom = intclk.tm_mday;
+     mon = intclk.tm_mon;
+     yr = (intclk.tm_year % 100);
+     cent = ((intclk.tm_year - yr) / 100) % 4;
+     sum = dom+mon+yr+cent;
+     wd = ((sum + 6) % 7);
+    tm->tm_wday = wd;
+    tm->tm_mday = intclk.tm_mday;
+    tm->tm_mon = (intclk.tm_mon - 1);
+    tm->tm_year = (intclk.tm_year - 1900);
+}
+
+
+/* Set internal clock time. */
+void
+nvr_time_set(struct tm *tm)
+{
+    intclk.tm_sec = tm->tm_sec;
+    intclk.tm_min = tm->tm_min;
+    intclk.tm_hour = tm->tm_hour;
+    intclk.tm_wday = tm->tm_wday;
+    intclk.tm_mday = tm->tm_mday;
+    intclk.tm_mon = (tm->tm_mon + 1);
+    intclk.tm_year = (tm->tm_year + 1900);
+}
+
+
+/* Open or create a file in the NVR area. */
+FILE *
+nvr_fopen(wchar_t *str, wchar_t *mode)
+{
+    return(plat_fopen(nvr_path(str), mode));
 }

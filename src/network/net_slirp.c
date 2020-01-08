@@ -1,39 +1,91 @@
 /*
- * 86Box	A hypervisor and IBM PC system emulator that specializes in
- *		running old operating systems and software designed for IBM
- *		PC systems and compatibles from 1981 through fairly recent
- *		system designs based on the PCI bus.
+ * VARCem	Virtual ARchaeological Computer EMulator.
+ *		An emulator of (mostly) x86-based PC systems and devices,
+ *		using the ISA,EISA,VLB,MCA  and PCI system buses, roughly
+ *		spanning the era between 1981 and 1995.
  *
- *		This file is part of the 86Box distribution.
+ *		This file is part of the VARCem Project.
  *
  *		Handle SLiRP library processing.
  *
- * Version:	@(#)net_slirp.c	1.0.4	2017/06/14
+ * Version:	@(#)net_slirp.c	1.0.9	2019/11/14
  *
  * Author:	Fred N. van Kempen, <decwiz@yahoo.com>
+ *
+ *		Copyright 2017-2019 Fred N. van Kempen.
+ *
+ *		Redistribution and  use  in source  and binary forms, with
+ *		or  without modification, are permitted  provided that the
+ *		following conditions are met:
+ *
+ *		1. Redistributions of  source  code must retain the entire
+ *		   above notice, this list of conditions and the following
+ *		   disclaimer.
+ *
+ *		2. Redistributions in binary form must reproduce the above
+ *		   copyright  notice,  this list  of  conditions  and  the
+ *		   following disclaimer in  the documentation and/or other
+ *		   materials provided with the distribution.
+ *
+ *		3. Neither the  name of the copyright holder nor the names
+ *		   of  its  contributors may be used to endorse or promote
+ *		   products  derived from  this  software without specific
+ *		   prior written permission.
+ *
+ * THIS SOFTWARE  IS  PROVIDED BY THE  COPYRIGHT  HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND  ANY EXPRESS  OR  IMPLIED  WARRANTIES,  INCLUDING, BUT  NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+ * PARTICULAR PURPOSE  ARE  DISCLAIMED. IN  NO  EVENT  SHALL THE COPYRIGHT
+ * HOLDER OR  CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL,  EXEMPLARY,  OR  CONSEQUENTIAL  DAMAGES  (INCLUDING,  BUT  NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE  GOODS OR SERVICES;  LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED  AND ON  ANY
+ * THEORY OF  LIABILITY, WHETHER IN  CONTRACT, STRICT  LIABILITY, OR  TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING  IN ANY  WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
+#include <wchar.h>
+#define HAVE_STDARG_H
 #include "slirp/slirp.h"
 #include "slirp/queue.h"
-#include "../ibm.h"
-#include "../config.h"
+#include "../86box.h"
 #include "../device.h"
+#include "../plat.h"
+// #include "../ui.h"
 #include "network.h"
-#include "../win/plat_thread.h"
 
 
-static queueADT	slirpq;			/* SLiRP library handle */
-static thread_t	*poll_tid;
-static NETRXCB	poll_rx;		/* network RX function to call */
-static void	*poll_arg;		/* network RX function arg */
+static volatile queueADT	slirpq;		/* SLiRP library handle */
+static volatile thread_t	*poll_tid;
+static const netcard_t		*poll_card;	/* netcard attached to us */
+static event_t			*poll_state;
 
 
-/* Instead of calling this and crashing some times
-   or experencing jitter, this is called by the 
-   60Hz clock which seems to do the job. */
+#ifdef ENABLE_SLIRP_LOG
+int slirp_do_log = ENABLE_SLIRP_LOG;
+
+
+static void
+slirp_log(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (slirp_do_log) {
+	va_start(ap, fmt);
+	pclog_ex(fmt, ap);
+	va_end(ap);
+    }
+}
+#else
+#define slirp_log(fmt, ...)
+#endif
+
+
 static void
 slirp_tic(void)
 {
@@ -67,128 +119,173 @@ slirp_tic(void)
 static void
 poll_thread(void *arg)
 {
+    uint8_t *mac = (uint8_t *)arg;
     struct queuepacket *qp;
+    uint32_t mac_cmp32[2];
+    uint16_t mac_cmp16[2];
     event_t *evt;
+    int data_valid = 0;
 
-    pclog("SLiRP: polling thread started, arg %08lx\n", arg);
+    slirp_log("SLiRP: polling started.\n");
+    thread_set_event(poll_state);
 
     /* Create a waitable event. */
     evt = thread_create_event();
 
     while (slirpq != NULL) {
+	/* Request ownership of the queue. */
+	network_wait(1);
+
+	/* Wait for a poll request. */
+	network_poll();
+
 	/* See if there is any work. */
 	slirp_tic();
 
+	/* Our queue may have been nuked.. */
+	if (slirpq == NULL) break;
+
 	/* Wait for the next packet to arrive. */
-	if (QueuePeek(slirpq) == 0) {
-		/* If we did not get anything, wait a while. */
-		thread_wait_event(evt, 10);
-		continue;
+	data_valid = 0;
+
+	if (!network_get_wait() && (QueuePeek(slirpq) != 0)) {
+		/* Grab a packet from the queue. */
+		// ui_sb_update_icon(SB_NETWORK, 1);
+
+		qp = QueueDelete(slirpq);
+		slirp_log("SLiRP: inQ:%d  got a %dbyte packet @%08lx\n",
+				QueuePeek(slirpq), qp->len, qp);
+
+		/* Received MAC. */
+		mac_cmp32[0] = *(uint32_t *)(((uint8_t *)qp->data)+6);
+		mac_cmp16[0] = *(uint16_t *)(((uint8_t *)qp->data)+10);
+
+		/* Local MAC. */
+		mac_cmp32[1] = *(uint32_t *)mac;
+		mac_cmp16[1] = *(uint16_t *)(mac+4);
+		if ((mac_cmp32[0] != mac_cmp32[1]) ||
+		    (mac_cmp16[0] != mac_cmp16[1])) {
+
+			poll_card->rx(poll_card->priv, (uint8_t *)qp->data, qp->len); 
+			data_valid = 1;
+		}
+
+		/* Done with this one. */
+		free(qp);
 	}
 
-	/* Grab a packet from the queue. */
-	qp = QueueDelete(slirpq);
-#if 0
-	pclog("SLiRP: inQ:%d  got a %dbyte packet @%08lx\n",
-				QueuePeek(slirpq), qp->len, qp);
-#endif
+	/* If we did not get anything, wait a while. */
+	if (!data_valid) {
+		// ui_sb_update_icon(SB_NETWORK, 0);
+		thread_wait_event(evt, 10);
+	}
 
-	if (poll_rx != NULL)
-		poll_rx(poll_arg, (uint8_t *)&qp->data, qp->len); 
-
-	/* Done with this one. */
-	free(qp);
+	/* Release ownership of the queue. */
+	network_wait(0);
     }
 
-    thread_destroy_event(evt);
-    poll_tid = NULL;
+    /* No longer needed. */
+    if (evt != NULL)
+	thread_destroy_event(evt);
 
-    pclog("SLiRP: polling stopped.\n");
+    slirp_log("SLiRP: polling stopped.\n");
+    thread_set_event(poll_state);
 }
 
 
-/* Initialize SLiRP for us. */
+/* Initialize SLiRP for use. */
 int
-network_slirp_setup(uint8_t *mac, NETRXCB func, void *arg)
+net_slirp_init(void)
 {
-    pclog("SLiRP: initializing..\n");
+    slirp_log("SLiRP: initializing..\n");
 
     if (slirp_init() != 0) {
-	pclog("SLiRP could not be initialized!\n");
+	slirp_log("SLiRP could not be initialized!\n");
 	return(-1);
     }
 
     slirpq = QueueCreate();
-    pclog(" Packet queue is at %08lx\n", &slirpq);
+
+    poll_tid = NULL;
+    poll_state = NULL;
+    poll_card = NULL;
+
+    return(0);
+}
+
+
+/* Initialize SLiRP for use. */
+int
+net_slirp_reset(const netcard_t *card, uint8_t *mac)
+{
+    // ui_sb_update_icon(SB_NETWORK, 0);
 
     /* Save the callback info. */
-    poll_rx = func;
-    poll_arg = arg;
+    poll_card = card;
 
-    pclog("SLiRP: starting thread..\n");
+    slirp_log("SLiRP: creating thread..\n");
+    poll_state = thread_create_event();
     poll_tid = thread_create(poll_thread, mac);
+    thread_wait_event(poll_state, -1);
 
     return(0);
 }
 
 
 void
-network_slirp_close(void)
+net_slirp_close(void)
 {
     queueADT sl;
 
-    if (slirpq != NULL) {
-	pclog("Closing SLiRP\n");
+    // ui_sb_update_icon(SB_NETWORK, 0);
 
-	/* Tell the polling thread to shut down. */
-	sl = slirpq; slirpq = NULL;
-#if 1
-	/* Terminate the polling thread. */
-	if (poll_tid != NULL) {
-		thread_kill(poll_tid);
-		poll_tid = NULL;
-	}
-#else
-	/* Wait for the polling thread to shut down. */
-	while (poll_tid != NULL)
-		;
-#endif
+    if (slirpq == NULL) return;
 
-	/* OK, now shut down SLiRP itself. */
-	QueueDestroy(sl);
-	slirp_exit(0);
+    slirp_log("SLiRP: closing.\n");
+
+    /* Tell the polling thread to shut down. */
+    sl = slirpq; slirpq = NULL;
+
+    /* Tell the thread to terminate. */
+    if (poll_tid != NULL) {
+	network_busy(0);
+
+	/* Wait for the thread to finish. */
+	slirp_log("SLiRP: waiting for thread to end...\n");
+	thread_wait_event(poll_state, -1);
+	slirp_log("SLiRP: thread ended\n");
+	thread_destroy_event(poll_state);
+
+	poll_tid = NULL;
+	poll_state = NULL;
+	poll_card = NULL;
     }
 
-    poll_rx = NULL;
-    poll_arg = NULL;
-}
-
-
-/* Test SLiRP - 1 = success, 0 = failure. */
-int
-network_slirp_test(void)
-{
-    if (slirp_init() != 0) {
-	pclog("SLiRP could not be initialized!\n");
-	return 0;
-    }
-    else
-    {
-	slirp_exit(0);
-	return 1;
-    }
+    /* OK, now shut down SLiRP itself. */
+    QueueDestroy(sl);
+    slirp_exit(0);
 }
 
 
 /* Send a packet to the SLiRP interface. */
 void
-network_slirp_in(uint8_t *pkt, int pkt_len)
+net_slirp_in(uint8_t *pkt, int pkt_len)
 {
-    if (slirpq != NULL)
-	slirp_input((const uint8_t *)pkt, pkt_len);
+    if (slirpq == NULL) return;
+
+    // ui_sb_update_icon(SB_NETWORK, 1);
+
+    network_busy(1);
+
+    slirp_input((const uint8_t *)pkt, pkt_len);
+
+    network_busy(0);
+
+    // ui_sb_update_icon(SB_NETWORK, 0);
 }
 
 
+/* Needed by SLiRP library. */
 void
 slirp_output(const uint8_t *pkt, int pkt_len)
 {
@@ -203,6 +300,7 @@ slirp_output(const uint8_t *pkt, int pkt_len)
 }
 
 
+/* Needed by SLiRP library. */
 int
 slirp_can_output(void)
 {

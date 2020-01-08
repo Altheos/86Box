@@ -1,23 +1,43 @@
 /*
- * 86Box	A hypervisor and IBM PC system emulator that specializes in
- *		running old operating systems and software designed for IBM
- *		PC systems and compatibles from 1981 through fairly recent
- *		system designs based on the PCI bus.
+ * VARCem	Virtual ARchaeological Computer EMulator.
+ *		An emulator of (mostly) x86-based PC systems and devices,
+ *		using the ISA,EISA,VLB,MCA  and PCI system buses, roughly
+ *		spanning the era between 1981 and 1995.
  *
- *		This file is part of the 86Box distribution.
+ *		This file is part of the VARCem Project.
  *
  *		286/386+ instruction handlers list.
  *
- * Version:	@(#)386_ops.h	1.0.0	2017/05/30
+ * Version:	@(#)386_ops.h	1.0.5	2018/10/17
  *
- * Author:	Sarah Walker, <http://pcem-emulator.co.uk/>
+ * Authors:	Fred N. van Kempen, <decwiz@yahoo.com>
+ *		Sarah Walker, <tommowalker@tommowalker.co.uk>
  *		leilei,
  *		Miran Grca, <mgrca8@gmail.com>
- *		Copyright 2008-2017 Sarah Walker.
- *		Copyright 2016-2017 leilei.
- *		Copyright 2016-2017 Miran Grca.
+ *
+ *		Copyright 2018 Fred N. van Kempen.
+ *		Copyright 2008-2018 Sarah Walker.
+ *		Copyright 2016-2018 leilei.
+ *		Copyright 2016-2018 Miran Grca.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free  Software  Foundation; either  version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is  distributed in the hope that it will be useful, but
+ * WITHOUT   ANY  WARRANTY;  without  even   the  implied  warranty  of
+ * MERCHANTABILITY  or FITNESS  FOR A PARTICULAR  PURPOSE. See  the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the:
+ *
+ *   Free Software Foundation, Inc.
+ *   59 Temple Place - Suite 330
+ *   Boston, MA 02111-1307
+ *   USA.
  */
-
 #include "x86_ops.h"
 
 
@@ -147,7 +167,27 @@ static int ILLEGAL(uint32_t fetchdat)
         return 0;
 }
 
+#if defined(DEV_BRANCH) && (defined(USE_AMD_K) || defined(USE_I686))
+static int internal_illegal(char *s)
+{
+	cpu_state.pc = cpu_state.oldpc;
+	x86gpf(s, 0);
+	return cpu_state.abrt;
+}
+#endif
+
+#ifdef ENABLE_386_DYNAREC_LOG
+extern void	x386_dynarec_log(const char *fmt, ...);
+#else
+#ifndef x386_dynarec_log
+#define x386_dynarec_log(fmt, ...)
+#endif
+#endif
+
 #include "x86seg.h"
+#if defined(DEV_BRANCH) && defined(USE_AMD_K)
+# include "x86_ops_amd.h"
+#endif
 #include "x86_ops_arith.h"
 #include "x86_ops_atomic.h"
 #include "x86_ops_bcd.h"
@@ -162,7 +202,9 @@ static int ILLEGAL(uint32_t fetchdat)
 #include "x86_ops_jump.h"
 #include "x86_ops_misc.h"
 #include "x87_ops.h"
-#include "x86_ops_i686.h"
+#if defined(DEV_BRANCH) && defined(USE_I686)
+# include "x86_ops_i686.h"
+#endif
 #include "x86_ops_mmx.h"
 #include "x86_ops_mmx_arith.h"
 #include "x86_ops_mmx_cmp.h"
@@ -185,6 +227,7 @@ static int ILLEGAL(uint32_t fetchdat)
 #include "x86_ops_stack.h"
 #include "x86_ops_string.h"
 #include "x86_ops_xchg.h"
+
 
 static int op0F_w_a16(uint32_t fetchdat)
 {
@@ -227,7 +270,8 @@ static int op0F_l_a32(uint32_t fetchdat)
         return x86_opcodes_0f[opcode | 0x300](fetchdat >> 8);
 }
 
-OpFn OP_TABLE(286_0f)[1024] = 
+
+const OpFn OP_TABLE(286_0f)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        
@@ -318,7 +362,7 @@ OpFn OP_TABLE(286_0f)[1024] =
 /*f0*/  ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,
 };
 
-OpFn OP_TABLE(386_0f)[1024] = 
+const OpFn OP_TABLE(386_0f)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        
@@ -409,7 +453,7 @@ OpFn OP_TABLE(386_0f)[1024] =
 /*f0*/  ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,
 };
 
-OpFn OP_TABLE(486_0f)[1024] = 
+const OpFn OP_TABLE(486_0f)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        
@@ -500,7 +544,7 @@ OpFn OP_TABLE(486_0f)[1024] =
 /*f0*/  ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,
 };
 
-OpFn OP_TABLE(winchip_0f)[1024] = 
+const OpFn OP_TABLE(winchip_0f)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        
@@ -591,7 +635,7 @@ OpFn OP_TABLE(winchip_0f)[1024] =
 /*f0*/  ILLEGAL,        opPSLLW_a32,    opPSLLD_a32,    opPSLLQ_a32,    ILLEGAL,        opPMADDWD_a32,  ILLEGAL,        ILLEGAL,        opPSUBB_a32,    opPSUBW_a32,    opPSUBD_a32,    ILLEGAL,        opPADDB_a32,    opPADDW_a32,    opPADDD_a32,    ILLEGAL,
 };
 
-OpFn OP_TABLE(pentium_0f)[1024] = 
+const OpFn OP_TABLE(pentium_0f)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        
@@ -682,7 +726,7 @@ OpFn OP_TABLE(pentium_0f)[1024] =
 /*f0*/  ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,        ILLEGAL,
 };
 
-OpFn OP_TABLE(pentiummmx_0f)[1024] = 
+const OpFn OP_TABLE(pentiummmx_0f)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        
@@ -773,7 +817,8 @@ OpFn OP_TABLE(pentiummmx_0f)[1024] =
 /*f0*/  ILLEGAL,        opPSLLW_a32,    opPSLLD_a32,    opPSLLQ_a32,    ILLEGAL,        opPMADDWD_a32,  ILLEGAL,        ILLEGAL,        opPSUBB_a32,    opPSUBW_a32,    opPSUBD_a32,    ILLEGAL,        opPADDB_a32,    opPADDW_a32,    opPADDD_a32,    ILLEGAL,
 };
 
-OpFn OP_TABLE(k6_0f)[1024] = 
+#if defined(DEV_BRANCH) && defined(USE_AMD_K)
+const OpFn OP_TABLE(k6_0f)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        
@@ -863,8 +908,10 @@ OpFn OP_TABLE(k6_0f)[1024] =
 /*e0*/  ILLEGAL,        opPSRAW_a32,    opPSRAD_a32,    ILLEGAL,        ILLEGAL,        opPMULHW_a32,   ILLEGAL,        ILLEGAL,        opPSUBSB_a32,   opPSUBSW_a32,   NULL,           opPOR_a32,      opPADDSB_a32,   opPADDSW_a32,   NULL,           opPXOR_a32,
 /*f0*/  ILLEGAL,        opPSLLW_a32,    opPSLLD_a32,    opPSLLQ_a32,    ILLEGAL,        opPMADDWD_a32,  ILLEGAL,        ILLEGAL,        opPSUBB_a32,    opPSUBW_a32,    opPSUBD_a32,    ILLEGAL,        opPADDB_a32,    opPADDW_a32,    opPADDD_a32,    ILLEGAL,
 };
+#endif
 
-OpFn OP_TABLE(c6x86mx_0f)[1024] = 
+#if defined(DEV_BRANCH) && defined(USE_CYRIX_6X86)
+const OpFn OP_TABLE(c6x86mx_0f)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        
@@ -954,8 +1001,11 @@ OpFn OP_TABLE(c6x86mx_0f)[1024] =
 /*e0*/  ILLEGAL,        opPSRAW_a32,    opPSRAD_a32,    ILLEGAL,        ILLEGAL,        opPMULHW_a32,   ILLEGAL,        ILLEGAL,        opPSUBSB_a32,   opPSUBSW_a32,   NULL,           opPOR_a32,      opPADDSB_a32,   opPADDSW_a32,   NULL,           opPXOR_a32,
 /*f0*/  ILLEGAL,        opPSLLW_a32,    opPSLLD_a32,    opPSLLQ_a32,    ILLEGAL,        opPMADDWD_a32,  ILLEGAL,        ILLEGAL,        opPSUBB_a32,    opPSUBW_a32,    opPSUBD_a32,    ILLEGAL,        opPADDB_a32,    opPADDW_a32,    opPADDD_a32,    ILLEGAL,
 };
+#endif
 
-OpFn OP_TABLE(pentiumpro_0f)[1024] = 
+#ifdef DEV_BRANCH
+#ifdef USE_I686
+const OpFn OP_TABLE(pentiumpro_0f)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        
@@ -1047,7 +1097,7 @@ OpFn OP_TABLE(pentiumpro_0f)[1024] =
 };
 
 #if 0
-OpFn OP_TABLE(pentium2_0f)[1024] = 
+const OpFn OP_TABLE(pentium2_0f)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        
@@ -1139,7 +1189,7 @@ OpFn OP_TABLE(pentium2_0f)[1024] =
 };
 #endif
 
-OpFn OP_TABLE(pentium2d_0f)[1024] = 
+const OpFn OP_TABLE(pentium2d_0f)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        
@@ -1229,8 +1279,10 @@ OpFn OP_TABLE(pentium2d_0f)[1024] =
 /*e0*/  ILLEGAL,        opPSRAW_a32,    opPSRAD_a32,    ILLEGAL,        ILLEGAL,        opPMULHW_a32,   ILLEGAL,        ILLEGAL,        opPSUBSB_a32,   opPSUBSW_a32,   NULL,           opPOR_a32,      opPADDSB_a32,   opPADDSW_a32,   NULL,           opPXOR_a32,
 /*f0*/  ILLEGAL,        opPSLLW_a32,    opPSLLD_a32,    opPSLLQ_a32,    ILLEGAL,        opPMADDWD_a32,  ILLEGAL,        ILLEGAL,        opPSUBB_a32,    opPSUBW_a32,    opPSUBD_a32,    ILLEGAL,        opPADDB_a32,    opPADDW_a32,    opPADDD_a32,    ILLEGAL,
 };
+#endif
+#endif
 
-OpFn OP_TABLE(286)[1024] = 
+const OpFn OP_TABLE(286)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        
@@ -1321,7 +1373,7 @@ OpFn OP_TABLE(286)[1024] =
 /*f0*/  opLOCK,         opLOCK,         opREPNE,        opREPE,         opHLT,          opCMC,          opF6_a16,       opF7_w_a16,     opCLC,          opSTC,          opCLI,          opSTI,          opCLD,          opSTD,          opINCDEC_b_a16, opFF_w_a16,
 };
 
-OpFn OP_TABLE(386)[1024] = 
+const OpFn OP_TABLE(386)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        
@@ -1412,7 +1464,7 @@ OpFn OP_TABLE(386)[1024] =
 /*f0*/  opLOCK,         opINT1,         opREPNE,        opREPE,         opHLT,          opCMC,          opF6_a32,       opF7_l_a32,     opCLC,          opSTC,          opCLI,          opSTI,          opCLD,          opSTD,          opINCDEC_b_a32, opFF_l_a32,
 }; 
 
-OpFn OP_TABLE(REPE)[1024] = 
+const OpFn OP_TABLE(REPE)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        
@@ -1503,7 +1555,7 @@ OpFn OP_TABLE(REPE)[1024] =
 /*f0*/  0,              0,              0,              0,              0,              0,              0,              0,              0,              0,              0,              0,              0,              0,              0,              0,
 };
 
-OpFn OP_TABLE(REPNE)[1024] = 
+const OpFn OP_TABLE(REPNE)[1024] = 
 {
         /*16-bit data, 16-bit addr*/
 /*      00              01              02              03              04              05              06              07              08              09              0a              0b              0c              0d              0e              0f*/        

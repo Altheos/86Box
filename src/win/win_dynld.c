@@ -8,19 +8,42 @@
  *
  *		Try to load a support DLL.
  *
- * Version:	@(#)win_dynld.c	1.0.2	2017/05/24
+ * Version:	@(#)win_dynld.c	1.0.8	2018/10/18
  *
  * Author:	Fred N. van Kempen, <decwiz@yahoo.com>
- *		Copyright 2017 Fred N. van Kempen
+ *
+ *		Copyright 2017,2018 Fred N. van Kempen
  */
-#include <windows.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <pcap.h>
-#include "plat_dynld.h"
-#include "../ibm.h"
+#include <stdlib.h>
+#include <wchar.h>
+#include <windows.h>
+#define HAVE_STDARG_H
+#include "../86box.h"
+#include "../plat_dynld.h"
+
+
+#ifdef ENABLE_DYNLD_LOG
+int dynld_do_log = ENABLE_DYNLD_LOG;
+
+
+static void
+dynld_log(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (dynld_do_log) {
+	va_start(ap, fmt);
+	pclog_ex(fmt, ap);
+	va_end(ap);
+    }
+}
+#else
+#define dynld_log(fmt, ...)
+#endif
 
 
 void *
@@ -29,11 +52,10 @@ dynld_module(const char *name, dllimp_t *table)
     HMODULE h;
     dllimp_t *imp;
     void *func;
-    /* char **foo; */
 
     /* See if we can load the desired module. */
     if ((h = LoadLibrary(name)) == NULL) {
-	pclog("DynLd(\"%s\"): library not found!\n", name);
+	dynld_log("DynLd(\"%s\"): library not found!\n", name);
 	return(NULL);
     }
 
@@ -41,7 +63,7 @@ dynld_module(const char *name, dllimp_t *table)
     for (imp=table; imp->name!=NULL; imp++) {
 	func = GetProcAddress(h, imp->name);
 	if (func == NULL) {
-		pclog("DynLd(\"%s\"): function '%s' not found!\n",
+		dynld_log("DynLd(\"%s\"): function '%s' not found!\n",
 						name, imp->name);
 		CloseHandle(h);
 		return(NULL);

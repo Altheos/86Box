@@ -6,13 +6,11 @@
 */
 
 #ifdef __linux__
-#include <sys/mman.h>
-#include <unistd.h>
+# include <sys/mman.h>
+# include <unistd.h>
 #endif
 #if WIN64
-#define BITMAP windows_BITMAP
-#include <windows.h>
-#undef BITMAP
+# include <windows.h>
 #endif
 
 #include <xmmintrin.h>
@@ -802,7 +800,7 @@ static inline void voodoo_generate(uint8_t *code_block, voodoo_t *voodoo, voodoo
 
                 if (depth_jump_pos)
                         *(uint8_t *)&code_block[depth_jump_pos] = (block_pos - depth_jump_pos) - 1;
-                if (depth_jump_pos2)
+                if (depth_jump_pos)
                         *(uint8_t *)&code_block[depth_jump_pos2] = (block_pos - depth_jump_pos2) - 1;
                 
                 if ((params->fogMode & (FOG_ENABLE|FOG_CONSTANT|FOG_Z|FOG_ALPHA)) == FOG_ENABLE)
@@ -1854,7 +1852,8 @@ static inline void voodoo_generate(uint8_t *code_block, voodoo_t *voodoo, voodoo
                                 addbyte(0x6e);
                                 addbyte(0x8e);
                                 addlong(offsetof(voodoo_params_t, color0));
-                                /*JMP +*/
+                                addbyte(0xeb); /*JMP +*/
+                                addbyte(8+5+4+4);
                         /*!cc_localselect:*/
                                 addbyte(0xf3); /*MOVDQU XMM1, ib*/ /* ir, ig and ib must be in same dqword!*/
                                 addbyte(0x0f);

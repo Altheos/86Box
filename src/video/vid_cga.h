@@ -8,12 +8,12 @@
  *
  *		Emulation of the old and new IBM CGA graphics cards.
  *
- * Version:	@(#)vid_cga.h	1.0.0	2017/05/30
+ * Version:	@(#)vid_cga.h	1.0.4	2018/10/02
  *
  * Author:	Sarah Walker, <http://pcem-emulator.co.uk/>
  *		Miran Grca, <mgrca8@gmail.com>
- *		Copyright 2008-2017 Sarah Walker.
- *		Copyright 2016-2017 Miran Grca.
+ *		Copyright 2008-2018 Sarah Walker.
+ *		Copyright 2016-2018 Miran Grca.
  */
 
 typedef struct cga_t
@@ -27,6 +27,7 @@ typedef struct cga_t
         
         uint8_t cgamode, cgacol;
 
+	int fontbase;
         int linepos, displine;
         int sc, vc;
         int cgadispon;
@@ -35,8 +36,8 @@ typedef struct cga_t
         uint16_t ma, maback;
         int oddeven;
 
-        int dispontime, dispofftime;
-        int vidtime;
+        uint64_t dispontime, dispofftime;
+        pc_timer_t timer;
         
         int firstline, lastline;
         
@@ -49,9 +50,7 @@ typedef struct cga_t
 	int revision;
 	int composite;
 	int snow_enabled;
-#ifndef __unix
 	int rgb_type;
-#endif
 } cga_t;
 
 void    cga_init(cga_t *cga);
@@ -62,4 +61,7 @@ uint8_t cga_read(uint32_t addr, void *p);
 void    cga_recalctimings(cga_t *cga);
 void    cga_poll(void *p);
 
-extern device_t cga_device;
+#ifdef EMU_DEVICE_H
+extern const device_config_t cga_config[];
+extern const device_t cga_device;
+#endif

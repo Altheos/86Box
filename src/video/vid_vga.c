@@ -1,13 +1,32 @@
-/* Copyright holders: Sarah Walker
-   see COPYING for more details
-*/
-/*IBM VGA emulation*/
+/*
+ * 86Box	A hypervisor and IBM PC system emulator that specializes in
+ *		running old operating systems and software designed for IBM
+ *		PC systems and compatibles from 1981 through fairly recent
+ *		system designs based on the PCI bus.
+ *
+ *		This file is part of the 86Box distribution.
+ *
+ *		IBM VGA emulation.
+ *
+ * Version:	@(#)vid_vga.c	1.0.6	2018/09/19
+ *
+ * Authors:	Sarah Walker, <http://pcem-emulator.co.uk/>
+ *		Miran Grca, <mgrca8@gmail.com>
+ *
+ *		Copyright 2008-2018 Sarah Walker.
+ *		Copyright 2016-2018 Miran Grca.
+ */
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
 #include <stdlib.h>
-#include "../ibm.h"
+#include <wchar.h>
+#include "../86box.h"
 #include "../io.h"
 #include "../mem.h"
 #include "../rom.h"
 #include "../device.h"
+#include "../timer.h"
 #include "video.h"
 #include "vid_svga.h"
 #include "vid_vga.h"
@@ -19,6 +38,10 @@ typedef struct vga_t
         
         rom_t bios_rom;
 } vga_t;
+
+static video_timings_t timing_vga	   = {VIDEO_ISA, 8, 16, 32, 8, 16, 32};
+static video_timings_t timing_ps1_svga_isa = {VIDEO_ISA, 6,  8, 16, 6,  8, 16};
+static video_timings_t timing_ps1_svga_mca = {VIDEO_MCA, 6,  8, 16, 6,  8, 16};
 
 void vga_out(uint16_t addr, uint8_t val, void *p)
 {
@@ -32,11 +55,11 @@ void vga_out(uint16_t addr, uint8_t val, void *p)
         switch (addr)
         {
                 case 0x3D4:
-                svga->crtcreg = val & 0x1f;
+                svga->crtcreg = val & 0x3f;
                 return;
                 case 0x3D5:
-		if (svga->crtcreg <= 0x18)
-			val &= mask_crtc[svga->crtcreg];
+		if (svga->crtcreg & 0x20)
+			return;
                 if ((svga->crtcreg < 7) && (svga->crtc[0x11] & 0x80))
                         return;
                 if ((svga->crtcreg == 7) && (svga->crtc[0x11] & 0x80))
@@ -71,7 +94,10 @@ uint8_t vga_in(uint16_t addr, void *p)
                 temp = svga->crtcreg;
                 break;
                 case 0x3D5:
-                temp = svga->crtc[svga->crtcreg];
+		if (svga->crtcreg & 0x20)
+			temp = 0xff;
+		else
+                	temp = svga->crtc[svga->crtcreg];
                 break;
                 default:
                 temp = svga_in(addr, svga);
@@ -80,12 +106,15 @@ uint8_t vga_in(uint16_t addr, void *p)
         return temp;
 }
 
-void *vga_init()
+
+static void *vga_init(const device_t *info)
 {
         vga_t *vga = malloc(sizeof(vga_t));
         memset(vga, 0, sizeof(vga_t));
 
         rom_init(&vga->bios_rom, L"roms/video/vga/ibm_vga.bin", 0xc0000, 0x8000, 0x7fff, 0x2000, MEM_MAPPING_EXTERNAL);
+
+	video_inform(VIDEO_FLAG_TYPE_SPECIAL, &timing_vga);
 
         svga_init(&vga->svga, vga, 1 << 18, /*256kb*/
                    NULL,
@@ -101,39 +130,18 @@ void *vga_init()
         return vga;
 }
 
-#ifdef DEV_BRANCH
-void *trigem_unk_init()
-{
-        vga_t *vga = malloc(sizeof(vga_t));
-        memset(vga, 0, sizeof(vga_t));
-
-        rom_init(&vga->bios_rom, L"roms/video/vga/ibm_vga.bin", 0xc0000, 0x8000, 0x7fff, 0x2000, MEM_MAPPING_EXTERNAL);
-
-        svga_init(&vga->svga, vga, 1 << 18, /*256kb*/
-                   NULL,
-                   vga_in, vga_out,
-                   NULL,
-                   NULL);
-
-        io_sethandler(0x03c0, 0x0020, vga_in, NULL, NULL, vga_out, NULL, NULL, vga);
-
-	io_sethandler(0x22ca, 0x0002, svga_in, NULL, NULL, vga_out, NULL, NULL, vga);
-	io_sethandler(0x22ce, 0x0002, svga_in, NULL, NULL, vga_out, NULL, NULL, vga);
-	io_sethandler(0x32ca, 0x0002, svga_in, NULL, NULL, vga_out, NULL, NULL, vga);
-
-        vga->svga.bpp = 8;
-        vga->svga.miscout = 1;
-        
-        return vga;
-}
-#endif
 
 /*PS/1 uses a standard VGA controller, but with no option ROM*/
-void *ps1vga_init()
+void *ps1vga_init(const device_t *info)
 {
         vga_t *vga = malloc(sizeof(vga_t));
         memset(vga, 0, sizeof(vga_t));
        
+	if (info->flags & DEVICE_MCA)
+		video_inform(VIDEO_FLAG_TYPE_SPECIAL, &timing_ps1_svga_mca);
+	else
+		video_inform(VIDEO_FLAG_TYPE_SPECIAL, &timing_ps1_svga_isa);
+
         svga_init(&vga->svga, vga, 1 << 18, /*256kb*/
                    NULL,
                    vga_in, vga_out,
@@ -148,7 +156,7 @@ void *ps1vga_init()
         return vga;
 }
 
-static int vga_available()
+static int vga_available(void)
 {
         return rom_present(L"roms/video/vga/ibm_vga.bin");
 }
@@ -176,45 +184,44 @@ void vga_force_redraw(void *p)
         vga->svga.fullchange = changeframecount;
 }
 
-void vga_add_status_info(char *s, int max_len, void *p)
-{
-        vga_t *vga = (vga_t *)p;
-        
-        svga_add_status_info(s, max_len, &vga->svga);
-}
-
-device_t vga_device =
+const device_t vga_device =
 {
         "VGA",
-        0,
+        DEVICE_ISA,
+	0,
         vga_init,
         vga_close,
+	NULL,
         vga_available,
         vga_speed_changed,
         vga_force_redraw,
-        vga_add_status_info
+        NULL
 };
-#ifdef DEV_BRANCH
-device_t trigem_unk_device =
-{
-        "VGA",
-        0,
-        trigem_unk_init,
-        vga_close,
-        vga_available,
-        vga_speed_changed,
-        vga_force_redraw,
-        vga_add_status_info
-};
-#endif
-device_t ps1vga_device =
+
+const device_t ps1vga_device =
 {
         "PS/1 VGA",
-        0,
+        DEVICE_ISA,
+	0,
         ps1vga_init,
         vga_close,
+	NULL,
         vga_available,
         vga_speed_changed,
         vga_force_redraw,
-        vga_add_status_info
+        NULL
+};
+
+const device_t ps1vga_mca_device =
+{
+        "PS/1 VGA",
+        DEVICE_MCA,
+	0,
+        ps1vga_init,
+        vga_close,
+	NULL,
+        vga_available,
+        vga_speed_changed,
+        vga_force_redraw,
+        NULL
 };

@@ -8,43 +8,63 @@
  *
  *		Sound emulation core.
  *
- * Version:	@(#)sound.h	1.0.1	2017/06/14
+ * Version:	@(#)sound.h	1.0.8	2018/10/26
  *
- * Author:	Sarah Walker, <http://pcem-emulator.co.uk/>
+ * Authors:	Sarah Walker, <http://pcem-emulator.co.uk/>
  *		Miran Grca, <mgrca8@gmail.com>
- *		Copyright 2008-2017 Sarah Walker.
- *		Copyright 2016-2017 Miran Grca.
+ *
+ *		Copyright 2008-2018 Sarah Walker.
+ *		Copyright 2016-2018 Miran Grca.
  */
+#ifndef EMU_SOUND_H
+# define EMU_SOUND_H
 
-void sound_add_handler(void (*get_buffer)(int32_t *buffer, int len, void *p), void *p);
 
-extern int sound_card_current;
+extern int sound_gain;
 
-int sound_card_available(int card);
-char *sound_card_getname(int card);
-struct device_t *sound_card_getdevice(int card);
-int sound_card_has_config(int card);
-char *sound_card_get_internal_name(int card);
-int sound_card_get_from_internal_name(char *s);
-void sound_card_init();
-void sound_set_cd_volume(unsigned int vol_l, unsigned int vol_r);
+#define SOUNDBUFLEN	(48000/50)
 
-#define CD_FREQ 44100
-#define CD_BUFLEN (CD_FREQ / 10)
+#define CD_FREQ		44100
+#define CD_BUFLEN	(CD_FREQ / 10)
 
-extern int sound_pos_global;
-void sound_speed_changed();
 
-extern int sound_is_float;
-void sound_realloc_buffers(void);
+extern int	ppispeakon;
+extern int	gated,
+		speakval,
+		speakon;
 
-void sound_init();
-void sound_reset();
+extern int	sound_pos_global;
+extern int	sound_card_current;
 
-void sound_cd_thread_reset();
 
-void closeal(void);
-void initalmain(int argc, char *argv[]);
-void inital();
-void givealbuffer(void *buf);
-void givealbuffer_cd(void *buf);
+extern void	sound_add_handler(void (*get_buffer)(int32_t *buffer, \
+				  int len, void *p), void *p);
+
+extern int	sound_card_available(int card);
+extern char	*sound_card_getname(int card);
+#ifdef EMU_DEVICE_H
+extern const device_t	*sound_card_getdevice(int card);
+#endif
+extern int	sound_card_has_config(int card);
+extern char	*sound_card_get_internal_name(int card);
+extern int	sound_card_get_from_internal_name(char *s);
+extern void	sound_card_init(void);
+extern void	sound_set_cd_volume(unsigned int vol_l, unsigned int vol_r);
+
+extern void	sound_speed_changed(void);
+
+extern void	sound_init(void);
+extern void	sound_reset(void);
+
+extern void	sound_card_reset(void);
+
+extern void	sound_cd_thread_end(void);
+extern void	sound_cd_thread_reset(void);
+
+extern void	closeal(void);
+extern void	inital(void);
+extern void	givealbuffer(void *buf);
+extern void	givealbuffer_cd(void *buf);
+
+
+#endif	/*EMU_SOUND_H*/

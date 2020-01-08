@@ -1,9 +1,13 @@
-#include "../ibm.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <wchar.h>
+#include "../86box.h"
+#include "../mem.h"
 #include "cpu.h"
 #include "x86.h"
 #include "x86_ops.h"
 #include "x87.h"
-#include "../mem.h"
 #include "codegen.h"
 #include "codegen_ops.h"
 #include "codegen_timing_common.h"

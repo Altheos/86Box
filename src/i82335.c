@@ -1,7 +1,9 @@
 /* Intel 82335 SX emulation, used by the Phoenix 386 clone. */
 
+#include <stdio.h>
 #include <stdint.h>
-#include "ibm.h"
+#include <string.h>
+#include <wchar.h>
 #include "io.h"
 #include "mem.h"
 
@@ -40,7 +42,7 @@ void i82335_write(uint16_t addr, uint8_t val, void *priv)
 				{
 					for (i = 0; i < 8; i++)
 					{
-						mem_set_mem_state(0xe0000, 0x20000, MEM_READ_EXTERNAL | MEM_WRITE_EXTERNAL);
+						mem_set_mem_state(0xe0000, 0x20000, MEM_READ_EXTANY | MEM_WRITE_EXTANY);
 						shadowbios = 0;
 					}
 				}
@@ -67,7 +69,7 @@ void i82335_write(uint16_t addr, uint8_t val, void *priv)
 				{
 					for (i = 0; i < 8; i++)
 					{
-						mem_set_mem_state(0xc0000, 0x20000, MEM_READ_EXTERNAL | MEM_WRITE_EXTERNAL);
+						mem_set_mem_state(0xc0000, 0x20000, MEM_READ_EXTANY | MEM_WRITE_EXTANY);
 						shadowbios = 0;
 					}
 				}
@@ -88,8 +90,8 @@ void i82335_write(uint16_t addr, uint8_t val, void *priv)
 				{
 					for (i = 0; i < 8; i++)
 					{
-						mem_write = (val & 8) ? MEM_WRITE_DISABLED : MEM_WRITE_EXTERNAL;
-						mem_set_mem_state(0xa0000, 0x20000, MEM_READ_EXTERNAL | mem_write);
+						mem_write = (val & 8) ? MEM_WRITE_DISABLED : MEM_WRITE_EXTANY;
+						mem_set_mem_state(0xa0000, 0x20000, MEM_READ_EXTANY | mem_write);
 						shadowbios = 0;
 					}
 				}

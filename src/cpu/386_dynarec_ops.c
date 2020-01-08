@@ -1,14 +1,21 @@
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <wchar.h>
 #include <math.h>
 #ifndef INFINITY
 # define INFINITY   (__builtin_inff())
 #endif
-#include "../ibm.h"
+#include "../86box.h"
 #include "cpu.h"
 #include "x86.h"
 #include "x86_ops.h"
 #include "x87.h"
 #include "x86_flags.h"
+#include "../io.h"
 #include "../mem.h"
+#include "../nmi.h"
 #include "codegen.h"
 #include "../pic.h"
 
@@ -17,14 +24,10 @@
 #include "386_common.h"
 
 
-extern uint16_t *mod1add[2][8];
-extern uint32_t *mod1seg[8];
-
 static __inline void fetch_ea_32_long(uint32_t rmdat)
 {
         eal_r = eal_w = NULL;
         easeg = cpu_state.ea_seg->base;
-        ea_rseg = cpu_state.ea_seg->seg;
         if (easeg != 0xFFFFFFFF && ((easeg + cpu_state.eaaddr) & 0xFFF) <= 0xFFC)
         {
                 uint32_t addr = easeg + cpu_state.eaaddr;
@@ -40,7 +43,6 @@ static __inline void fetch_ea_16_long(uint32_t rmdat)
 {
         eal_r = eal_w = NULL;
         easeg = cpu_state.ea_seg->base;
-        ea_rseg = cpu_state.ea_seg->seg;
         if (easeg != 0xFFFFFFFF && ((easeg + cpu_state.eaaddr) & 0xFFF) <= 0xFFC)
         {
                 uint32_t addr = easeg + cpu_state.eaaddr;
